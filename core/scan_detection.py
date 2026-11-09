@@ -224,7 +224,7 @@ def detect_scan(image, params, *, infrared=None, quick=True, region=None, subjec
         _map_from_preview(strokes, image.shape, line_image.shape)
     strokes = [stroke for stroke in strokes if stroke.confidence >= stroke_floor]
     minimum_confidence = params.get("min_confidence", 0.25)
-    focus = SceneFocus(image) if subject_first and region is None else None
+    focus = SceneFocus(image, prioritize_subject=subject_first) if region is None else None
     if focus is not None:
         for forehead in focus.forehead_regions():
             for candidate in detect_strokes(image, region=forehead):

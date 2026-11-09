@@ -3,5 +3,6 @@ PySide6-Essentials>=6.5.0
 # The desktop UI uses PySide6. Headless OpenCV avoids loading a second Qt.
 opencv-python-headless>=4.6.0
 numpy>=1.23.0
+scikit-image>=0.20.0
 tifffile>=2022.10.10
 Pillow>=9.4.0

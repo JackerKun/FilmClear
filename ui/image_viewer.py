@@ -11,6 +11,10 @@ from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QRubberBand
 from core.scan_io import display_pixels
 
 
+RETOUCH_MODES = ("clone", "spot")
+STROKE_MODES = ("draw", *RETOUCH_MODES)
+
+
 def photo_pixmap(image):
     pixels = np.ascontiguousarray(display_pixels(image))
     h, w = pixels.shape[:2]
@@ -37,6 +41,7 @@ class ImageViewer(QGraphicsView):
     annotation_right_clicked = Signal(int, object)
     region_selected = Signal(int, int, int, int, bool)
     stroke_drawn = Signal(object)
+    sample_requested = Signal(object)
     zoom_changed = Signal(int)
     view_changed = Signal()
     split_changed = Signal(int)
@@ -59,10 +64,15 @@ class ImageViewer(QGraphicsView):
         self._show_all = False
         self._fit = True
         self._before = QPixmap()
+        self._before_marks = []
         self._split = 50
         self._dragging_split = False
         self._selection_mode = None
         self.brush_radius = 14
+        self.retouch_radius = 14
+        self.clone_source = None
+        self._pointer_pos = None
+        self._sampling = False
         self.space_pan = False
         self._space_drag = None
         self.comparison_label = ""
@@ -72,8 +82,12 @@ class ImageViewer(QGraphicsView):
         self.horizontalScrollBar().valueChanged.connect(self.view_changed)
         self.verticalScrollBar().valueChanged.connect(self.view_changed)
         self.zoom_changed.connect(self.view_changed)
+        self.view_changed.connect(self._update_tool_cursor)
+        self._update_tool_cursor()
 
     def load_image(self, image):
+        self.clone_source = None
+        self._cancel_selection()
         self.clear_comparison()
         self.update_annotations([])
         self.replace_image(image)
@@ -82,11 +96,17 @@ class ImageViewer(QGraphicsView):
     def replace_image(self, image):
         self._photo.setPixmap(photo_pixmap(image))
         self.setSceneRect(QRectF(self._photo.pixmap().rect()))
+        self._update_tool_cursor()
         self.viewport().update()
 
     def clear_image(self):
+        self.clone_source = None
+        self._cancel_selection()
+        self.clear_comparison()
+        self.update_annotations([])
         self._photo.setPixmap(QPixmap())
         self.setSceneRect(QRectF())
+        self._update_tool_cursor()
 
     def get_image_size(self):
         bounds = self._photo.boundingRect()
@@ -121,15 +141,23 @@ class ImageViewer(QGraphicsView):
 
     def set_comparison(self, original):
         self._before = photo_pixmap(original)
+        self._update_tool_cursor()
         self.viewport().update()
 
     def clear_comparison(self):
         self._before = QPixmap()
+        self._before_marks = []
         self._dragging_split = False
+        self._update_tool_cursor()
         self.viewport().update()
 
     def set_split(self, position):
         self._split = position
+        self._update_tool_cursor()
+        self.viewport().update()
+
+    def set_original_marks(self, items):
+        self._before_marks = items
         self.viewport().update()
 
     def drawForeground(self, painter, rect):
@@ -143,26 +171,16 @@ class ImageViewer(QGraphicsView):
             return
 
         if not self._before.isNull():
-            self._draw_comparison(painter)
+            self._draw_comparison(painter, rect)
             return
         if self.comparison_label:
+            self._draw_marks(painter, rect, self._before_marks)
             self._draw_badge(painter)
             return
 
+        self._draw_marks(painter, rect, self._items.values(), skip_id=self._focus_id)
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        for item in self._items.values():
-            if item.id == self._focus_id or not self._show_all:
-                continue
-            point = QPointF(*item.center)
-            if not rect.contains(point):
-                continue
-            pen = QPen(QColor("#65dfcc") if item.selected else QColor("#e6bb72"))
-            pen.setCosmetic(True)
-            pen.setWidthF(1.25)
-            painter.setPen(pen)
-            radius = (4 if item.selected else 3) / self.transform().m11()
-            painter.drawEllipse(point, radius, radius)
         if self._focus_path is not None:
             for color, width in (("#17232d", 4), ("#64ebd2", 2)):
                 pen = QPen(QColor(color))
@@ -176,9 +194,10 @@ class ImageViewer(QGraphicsView):
             if max(focus.width, focus.height) * self.transform().m11() < 18:
                 painter.drawEllipse(point, radius, radius)
         if self._stroke:
-            pen = QPen(QColor(100, 235, 210, 85), self.brush_radius * 2,
-                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            pen.setCosmetic(True)
+            search = self._selection_mode == "draw"
+            radius = self.brush_radius if search else self.retouch_radius
+            pen = QPen(QColor(100, 235, 210, 85), radius * 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            pen.setCosmetic(search)
             painter.setPen(pen)
             path = QPainterPath(self._stroke[0])
             for point in self._stroke[1:]:
@@ -186,6 +205,46 @@ class ImageViewer(QGraphicsView):
             painter.drawPath(path)
             if len(self._stroke) == 1:
                 painter.drawPoint(self._stroke[0])
+        if self._selection_mode in STROKE_MODES and not self.space_pan:
+            self._draw_brush_cursor(painter)
+        painter.restore()
+
+    def _draw_brush_cursor(self, painter):
+        scale = self.transform().m11()
+        radius = self.brush_radius / scale if self._selection_mode == "draw" else self.retouch_radius
+        point = self._brush_position() if not self._is_sampling() else None
+        source = self.clone_source if self._selection_mode == "clone" else None
+        if source is not None and self._stroke:
+            source = source + self._stroke[-1] - self._stroke[0]
+        size = 6 / scale
+        for color, width in (("#17232d", 3), ("#eef5ff", 1)):
+            pen = QPen(QColor(color))
+            pen.setCosmetic(True)
+            pen.setWidth(width)
+            painter.setPen(pen)
+            if point is not None:
+                painter.drawEllipse(point, radius, radius)
+                if radius * scale < 4:
+                    painter.drawPoint(point)
+            if source is not None:
+                painter.drawLine(source - QPointF(size, 0), source + QPointF(size, 0))
+                painter.drawLine(source - QPointF(0, size), source + QPointF(0, size))
+
+    def _draw_marks(self, painter, rect, items, *, skip_id=None):
+        if not self._show_all:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        for item in items:
+            point = QPointF(*item.center)
+            if item.id == skip_id or not rect.contains(point):
+                continue
+            pen = QPen(QColor("#65dfcc") if item.selected else QColor("#e6bb72"))
+            pen.setCosmetic(True)
+            pen.setWidthF(1.25)
+            painter.setPen(pen)
+            radius = (4 if item.selected else 3) / self.transform().m11()
+            painter.drawEllipse(point, radius, radius)
         painter.restore()
 
     def _draw_badge(self, painter):
@@ -201,13 +260,14 @@ class ImageViewer(QGraphicsView):
         painter.drawText(rect, Qt.AlignCenter, self.comparison_label)
         painter.restore()
 
-    def _draw_comparison(self, painter):
+    def _draw_comparison(self, painter, rect):
         view = self.viewport().rect()
         split = round(view.width() * self._split / 100)
         painter.save()
         painter.setClipRect(self.mapToScene(QRect(0, 0, split, view.height())).boundingRect())
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.drawPixmap(0, 0, self._before)
+        self._draw_marks(painter, rect, self._before_marks)
         painter.restore()
 
         painter.save()
@@ -298,7 +358,12 @@ class ImageViewer(QGraphicsView):
         event.accept()
 
     def viewportEvent(self, event):
-        if event.type() == QEvent.NativeGesture and event.gestureType() == Qt.ZoomNativeGesture:
+        kind = event.type()
+        if kind == QEvent.Enter:
+            self._track_pointer(event.position().toPoint())
+        elif kind == QEvent.Leave:
+            self._track_pointer(None)
+        elif kind == QEvent.NativeGesture and event.gestureType() == Qt.ZoomNativeGesture:
             factor = math.exp(max(-0.16, min(0.16, event.value())))
             self._zoom_to(self.transform().m11() * factor, event.position().toPoint())
             event.accept()
@@ -308,8 +373,8 @@ class ImageViewer(QGraphicsView):
     def set_selection_mode(self, mode):
         self._selection_mode = mode
         self.setDragMode(QGraphicsView.NoDrag if mode else QGraphicsView.ScrollHandDrag)
-        self._update_tool_cursor()
         self._cancel_selection()
+        self._update_tool_cursor()
 
     def _cancel_selection(self):
         self._press = None
@@ -320,9 +385,46 @@ class ImageViewer(QGraphicsView):
     def _update_tool_cursor(self):
         if self.space_pan:
             cursor = Qt.ClosedHandCursor if self._space_drag is not None else Qt.OpenHandCursor
+        elif self._photo.pixmap().isNull():
+            cursor = Qt.ArrowCursor
+        elif self._dragging_split or (self._press is None and self._on_split(self._pointer_pos)):
+            cursor = Qt.SizeHorCursor
+        elif self._selection_mode in STROKE_MODES:
+            cursor = Qt.ArrowCursor
+            if self._brush_position() is not None:
+                cursor = Qt.CrossCursor if self._is_sampling() else Qt.BlankCursor
+        elif self._selection_mode:
+            cursor = Qt.CrossCursor
         else:
-            cursor = Qt.CrossCursor if self._selection_mode else Qt.ArrowCursor
-        self.viewport().setCursor(cursor)
+            cursor = Qt.ClosedHandCursor if self._press is not None else Qt.ArrowCursor
+        if self.viewport().cursor().shape() != cursor:
+            self.viewport().setCursor(cursor)
+
+    def _on_split(self, pos):
+        split = round(self.viewport().width() * self._split / 100)
+        return pos is not None and not self._before.isNull() and abs(pos.x() - split) <= 12
+
+    def _brush_position(self):
+        if self._pointer_pos is not None and self.viewport().rect().contains(self._pointer_pos):
+            point = self.mapToScene(self._pointer_pos)
+            if self.sceneRect().contains(point):
+                return point
+        return None
+
+    def _is_sampling(self):
+        return self._selection_mode == "clone" and self._sampling and not self._stroke
+
+    def set_sampling_cursor(self, active):
+        if self._sampling != active:
+            self._sampling = active
+            self._update_tool_cursor()
+            self.viewport().update()
+
+    def _track_pointer(self, pos):
+        self._pointer_pos = pos
+        self._update_tool_cursor()
+        if self._selection_mode in STROKE_MODES:
+            self.viewport().update()
 
     def set_space_pan(self, active):
         if self.space_pan == active:
@@ -332,6 +434,7 @@ class ImageViewer(QGraphicsView):
             self._dragging_split = False
             self._cancel_selection()
         self._update_tool_cursor()
+        self.viewport().update()
 
     def _stroke_point(self, pos):
         point = self.mapToScene(pos)
@@ -341,6 +444,8 @@ class ImageViewer(QGraphicsView):
 
     def mousePressEvent(self, event):
         pos = event.position().toPoint()
+        self.set_sampling_cursor(bool(event.modifiers() & Qt.AltModifier))
+        self._track_pointer(pos)
         if event.button() == Qt.LeftButton:
             self._space_drag = None
             if self.space_pan:
@@ -349,13 +454,19 @@ class ImageViewer(QGraphicsView):
                 event.accept()
                 return
             self._press = pos
-            split_x = round(self.viewport().width() * self._split / 100)
-            if not self._before.isNull() and abs(pos.x() - split_x) <= 12:
+            if self._on_split(pos):
                 self._dragging_split = True
+                self._update_tool_cursor()
                 return
-            if self._selection_mode == "draw":
+            if self._selection_mode in STROKE_MODES:
                 if self.sceneRect().contains(self.mapToScene(pos)):
-                    self._stroke = [self._stroke_point(pos)]
+                    point = self._stroke_point(pos)
+                    if (self._selection_mode == "clone"
+                            and event.modifiers() & Qt.AltModifier):
+                        self._press = None
+                        self.sample_requested.emit(point)
+                        return
+                    self._stroke = [point]
                     self.viewport().update()
                 return
             if self._selection_mode:
@@ -366,6 +477,8 @@ class ImageViewer(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
+        self.set_sampling_cursor(bool(event.modifiers() & Qt.AltModifier))
+        self._track_pointer(pos)
         if self._space_drag is not None:
             if self.space_pan:
                 delta = self._space_drag - pos
@@ -381,7 +494,7 @@ class ImageViewer(QGraphicsView):
             self.split_changed.emit(position)
             return
         if self._selection_mode and self._press is not None:
-            if self._selection_mode == "draw":
+            if self._selection_mode in STROKE_MODES:
                 if self._stroke:
                     self._stroke.append(self._stroke_point(pos))
                     self.viewport().update()
@@ -392,6 +505,8 @@ class ImageViewer(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         pos = event.position().toPoint()
+        self.set_sampling_cursor(bool(event.modifiers() & Qt.AltModifier))
+        self._track_pointer(pos)
         if event.button() == Qt.LeftButton:
             if self._space_drag is not None:
                 self._space_drag = None
@@ -401,11 +516,13 @@ class ImageViewer(QGraphicsView):
             start, self._press = self._press, None
             if self._dragging_split:
                 self._dragging_split = False
+                self._update_tool_cursor()
                 return
-            if self._selection_mode == "draw":
+            if self._selection_mode in STROKE_MODES:
                 if self._stroke:
                     self._stroke.append(self._stroke_point(pos))
                     points, self._stroke = self._stroke, []
+                    self._update_tool_cursor()
                     self.stroke_drawn.emit([(p.x(), p.y()) for p in points])
                     self.viewport().update()
                 return
@@ -423,8 +540,11 @@ class ImageViewer(QGraphicsView):
                 if dust_id is not None:
                     self.annotation_clicked.emit(dust_id)
         super().mouseReleaseEvent(event)
+        self._update_tool_cursor()
 
     def contextMenuEvent(self, event):
+        if self._selection_mode in RETOUCH_MODES:
+            return
         dust_id = self._annotation_at(event.pos())
         if dust_id is not None:
             self.annotation_right_clicked.emit(dust_id, event.globalPos())

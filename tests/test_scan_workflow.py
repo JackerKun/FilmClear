@@ -8,6 +8,7 @@ import tifffile
 
 from core.batch_export import SOURCE_FORMAT, ExportEntry, export_batch
 from core.dust_remover import DustRemover
+from core.manual_retouch import retouch_patch
 from core.scene_focus import SceneFocus
 from core.scan_detection import detect_brush, detect_scan
 from core.scan_io import read_ir_plane, read_scan, signature
@@ -159,6 +160,21 @@ class ScanWorkflowTest(unittest.TestCase):
         self.assertTrue(all(mask[y, x] for x, y in target))
         self.assertFalse(mask[409, 2490])
 
+    def test_spot_repair_tracks_forehead_fiber_with_a_small_soft_brush(self):
+        image = cv2.imread(str(self.demo_path("2026-10-29-0007.jpg")))
+        rough = [(2492, 461), (2509, 455), (2516, 435), (2520, 401), (2539, 380), (2555, 379)]
+        centers = np.array([(2502, 461), (2513, 455), (2520, 430), (2527, 400), (2539, 385), (2550, 384)])
+        patch, coverage = retouch_patch(image, rough, 6, 0.20, mode="spot",
+                                        repair_params=dict(method="auto", inpaint_radius=3))
+        width = image.shape[1]
+        target = centers[:, 1] * width + centers[:, 0]
+        self.assertTrue(np.all(np.isin(target, coverage)))
+        positions, before, after = patch
+        self.assertNotIn(409 * width + 2490, positions)  # Neighboring hairline.
+        indices = np.searchsorted(positions, target)
+        np.testing.assert_array_equal(positions[indices], target)
+        self.assertGreater((before[indices].astype(float) - after[indices]).mean(), 15)
+
     def test_brush_finds_bright_spot_inside_a_rough_loop(self):
         image = cv2.imread(str(self.demo_path("2026-10-28-0001.jpg")))
         gesture = [(1848, 6612), (1874, 6606), (1900, 6625), (1903, 6653),
@@ -190,6 +206,29 @@ class ScanWorkflowTest(unittest.TestCase):
         self.assertGreater(len(result.items), 0)
         self.assertLess(len(result.items), 75)
         self.assertTrue(all(650 < item.center_y < 3600 for item in result.items))
+
+    def test_rgb_scan_skips_dark_frame_with_cropped_perforations(self):
+        image = np.full((400, 600, 3), 7, np.uint8)
+        image[35:365, 37:563] = 110
+        for x in range(50, 560, 68):
+            cv2.rectangle(image, (x, 0), (x + 24, 19), (0, 0, 0), cv2.FILLED)
+            cv2.rectangle(image, (x, 380), (x + 24, 399), (0, 0, 0), cv2.FILLED)
+        frame_spot, picture_spot = (18, 200), (85, 200)
+        for center in (frame_spot, picture_spot):
+            cv2.circle(image, center, 4, (230, 230, 230), cv2.FILLED)
+
+        for subject_first in (True, False):
+            items = detect_scan(image, PARAMS, subject_first=subject_first).items
+            self.assertIn(picture_spot, [item.center for item in items])
+            self.assertTrue(all(35 <= item.center_x < 565 and 33 <= item.center_y < 367
+                                for item in items))
+        local = detect_scan(image, PARAMS, region=(6, 180, 32, 220)).items
+        self.assertIn(frame_spot, [item.center for item in local])
+
+    def test_single_dark_edge_does_not_trigger_frame_protection(self):
+        image = np.full((400, 600, 3), 110, np.uint8)
+        image[:35] = 7
+        self.assertEqual(SceneFocus(image, prioritize_subject=False).margins, [])
 
     def test_real_vuescan_fixture(self):
         scan = read_scan(self.demo_path("VueScan-RGBI-raw0048-crop.tif"))

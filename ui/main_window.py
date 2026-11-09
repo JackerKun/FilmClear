@@ -1,37 +1,40 @@
 """FilmClear workspace and non-destructive editing session."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import ceil
 from pathlib import Path
 import sqlite3
+import sys
 from threading import Event
 from zipfile import BadZipFile
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QProcess, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QApplication, QBoxLayout, QButtonGroup, QComboBox, QFileDialog,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider, QSplitter, QStatusBar,
-    QSpinBox, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QApplication, QBoxLayout, QButtonGroup, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QProgressBar, QPushButton, QSizePolicy, QSlider, QSplitter, QStatusBar,
+    QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from config import Config
 from core.batch_export import ExportEntry, export_batch, replay_patches
 from core.dust_remover import DustRemover
 from core.inspection import dust_view, infrared_view
+from core.manual_retouch import covered_candidates, retouch_patch
 from core.repeated_defects import repeated_defects
 from core.review_report import create_review_report
 from core.scan_detection import detect_brush, detect_scan, refine_candidate
-from core.scan_io import TIFF_EXTENSIONS, read_ir_plane, read_scan, signature
+from core.scan_io import TIFF_EXTENSIONS, Scan, read_ir_plane, read_scan, signature
 from core.workspace_store import WorkspaceStore
 
 from .dust_panel import DustPanel
 from .export_dialog import ExportDialog
 from .file_panel import FilePanel
-from .image_viewer import ImageViewer, defect_path
+from .image_viewer import RETOUCH_MODES, ImageViewer, defect_path
+from .notice_dialog import NoticeDialog
 from .scan_queue import ScanQueueDialog
 from .repeat_dialog import RepeatDialog
 from .theme_manager import ThemeManager
@@ -72,7 +75,8 @@ class WorkspaceJob(QThread):
 class BusySpinner(QWidget):
     def __init__(self):
         super().__init__()
-        self.setFixedSize(32, 32)
+        self.setObjectName("loadingSpinner")
+        self.setFixedSize(22, 22)
         self._angle = 0
         self._timer = QTimer(self)
         self._timer.setInterval(25)
@@ -93,10 +97,13 @@ class BusySpinner(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(4, 4, 24, 24)
-        painter.setPen(QPen(QColor("#384957"), 3))
+        rect = QRectF(3, 3, 16, 16)
+        accent = self.palette().windowText().color()
+        track = QColor(accent)
+        track.setAlpha(55)
+        painter.setPen(QPen(track, 2))
         painter.drawEllipse(rect)
-        painter.setPen(QPen(QColor("#72e5ce"), 3, Qt.SolidLine, Qt.RoundCap))
+        painter.setPen(QPen(accent, 2, Qt.SolidLine, Qt.RoundCap))
         painter.drawArc(rect, self._angle * 16, 105 * 16)
 
 
@@ -114,6 +121,10 @@ class EditCommand(QUndoCommand):
         self.old_ignored = list(window._ignored_items)
         self.new_ignored = [*self.old_ignored, *(replace(item) for item in ignored)]
 
+    def repaired_items(self):
+        remaining = {item.id for item in self.after}
+        return [replace(item, selected=True) for item in self.before if item.id not in remaining]
+
     def undo(self):
         if self.window._restoring_workspace:
             return
@@ -124,7 +135,7 @@ class EditCommand(QUndoCommand):
         if self.window._restoring_workspace:
             return
         self.window._apply_edit(self.after, self.new_ignored, self.new_revision,
-                                self.patch, use_after=True)
+                                self.patch, use_after=True, repaired=self.repaired_items() if self.patch else ())
 
 
 @dataclass
@@ -140,6 +151,7 @@ class PhotoState:
     ir_override: tuple[str, bool] | None
     view: tuple | None = None
     size: tuple | None = None
+    repaired_marks: dict = field(default_factory=dict)
 
 
 class MainWindow(QMainWindow):
@@ -162,6 +174,7 @@ class MainWindow(QMainWindow):
         self._photo_stamp = None
         self._photos = {}
         self._applied_patches = []
+        self._repaired_marks = {}
         self._infrared = None
         self._ir_source = ""
         self._ir_override = None
@@ -216,6 +229,20 @@ class MainWindow(QMainWindow):
         canvas.setContentsMargins(12, 12, 12, 10)
         canvas.setSpacing(9)
         header = QHBoxLayout()
+        self._sidebar_buttons = {}
+        self._sidebar_header_buttons = {}
+        for side in ("left", "right"):
+            edge_button = QPushButton(self)
+            header_button = QPushButton()
+            for button, width, height, icon_size in ((edge_button, 20, 44, 14), (header_button, 28, 28, 16)):
+                button.setObjectName("sidebarToggle")
+                button.setCheckable(True)
+                button.setFixedSize(width, height)
+                button.setIconSize(QSize(icon_size, icon_size))
+                button.setChecked(True)
+            self._sidebar_buttons[side] = edge_button
+            self._sidebar_header_buttons[side] = header_button
+        header.addWidget(self._sidebar_header_buttons["left"])
         self.document_title = QLabel("胶片工作台")
         self.document_title.setObjectName("titleLabel")
         self.document_title.setMinimumWidth(0)
@@ -225,17 +252,18 @@ class MainWindow(QMainWindow):
         self.btn_next = self._tool("›", "下一张照片", self.file_panel.select_next)
         self.btn_undo = self._tool("撤销", "撤销当前照片的上一步操作", self._undo)
         self.btn_redo = self._tool("重做", "重做上一步操作", self._redo)
-        self.btn_compare = self._tool("前后对比", "比较原片和修复结果 · B",
+        self.btn_compare = self._tool("前后对比", "比较原片和修复结果",
                                       self._toggle_comparison, checkable=True)
         for control in (self.btn_prev, self.btn_next, self.btn_undo, self.btn_redo, self.btn_compare):
             header.addWidget(control)
+        header.addWidget(self._sidebar_header_buttons["right"])
         canvas.addLayout(header)
 
         self.image_viewer = ImageViewer()
         self.original_viewer = ImageViewer()
         self.original_viewer.comparison_label = "原片"
         self.original_viewer.hide()
-        viewports = QWidget()
+        viewports = self._canvas_viewports = QWidget()
         self.view_layout = QBoxLayout(QBoxLayout.LeftToRight, viewports)
         self.view_layout.setContentsMargins(0, 0, 0, 0)
         self.view_layout.setSpacing(6)
@@ -291,7 +319,7 @@ class MainWindow(QMainWindow):
         self.edit_group = QButtonGroup(self.edit_toolbar)
         self.edit_buttons = {}
         for mode, label, name, hint in (
-            (None, "平移", "浏览 / 平移", "拖动画布平移，滚动缩放"),
+            (None, "指针", "指针", "点击选择候选，拖动可平移画布"),
             ("detect", "补查", "框选补查", "拖动框住遗漏的缺陷，在原图像素上补查轮廓"),
             ("draw", "描画", "描画补查", "在缺陷附近涂抹或圈起，查找真实缺陷轮廓"),
             ("check", "勾选", "框选勾选", "框内候选会被勾选，按住 Shift 可叠加多个框"),
@@ -317,9 +345,9 @@ class MainWindow(QMainWindow):
         self.brush_radius.setValue(self.image_viewer.brush_radius)
         self.brush_radius.setFixedWidth(48)
         self.brush_radius.setAccessibleName("搜索半径")
-        self.brush_radius.setToolTip("搜索半径（屏幕像素）")
+        self.brush_radius.setToolTip("搜索半径（屏幕像素） · [ 缩小 / ] 放大")
         self.brush_radius.hide()
-        self.btn_marks = self._tool("标记", "显示或隐藏全部候选标记 · M", checkable=True)
+        self.btn_marks = self._tool("标记", "显示或隐藏缺陷标记，包含对比中的原片", checkable=True)
         self.btn_marks.setObjectName("canvasToolBtn")
         self.btn_marks.setAccessibleName("全部标记")
         self.btn_marks.toggled.connect(self._toggle_marks)
@@ -327,10 +355,10 @@ class MainWindow(QMainWindow):
         edit_layout.addWidget(self.btn_marks)
         edit_layout.addWidget(self.brush_radius)
         edit_layout.addStretch()
-        self.btn_fit = self._tool("", "适应窗口 · F", self.image_viewer.fit_to_window)
+        self.btn_fit = self._tool("", "适应窗口", self.image_viewer.fit_to_window)
         self.btn_zoom_out = self._tool("", "缩小", self.image_viewer.zoom_out)
         self.btn_zoom_in = self._tool("", "放大", self.image_viewer.zoom_in)
-        self.btn_100 = self._tool("1:1", "原始像素 · 1", self.image_viewer.zoom_100)
+        self.btn_100 = self._tool("1:1", "原始像素", self.image_viewer.zoom_100)
         for control in (self.btn_fit, self.btn_zoom_out, self.btn_zoom_in, self.btn_100):
             control.setObjectName("canvasToolBtn")
             control.setAccessibleName(control.toolTip())
@@ -341,9 +369,10 @@ class MainWindow(QMainWindow):
         self.lbl_zoom.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         edit_layout.addWidget(self.lbl_zoom)
         canvas.addWidget(self.edit_toolbar)
+        canvas.addWidget(self._setup_retouch_toolbar())
         self._canvas_icons = {
             **self.compare_buttons,
-            **{mode or "pan": button for mode, button in self.edit_buttons.items()},
+            **{mode or "pointer": button for mode, button in self.edit_buttons.items()},
             "marks": self.btn_marks, "fit": self.btn_fit,
             "zoom-out": self.btn_zoom_out, "zoom-in": self.btn_zoom_in,
         }
@@ -353,6 +382,9 @@ class MainWindow(QMainWindow):
         self.dust_panel.setMinimumWidth(272)
         self.dust_panel.setMaximumWidth(390)
         splitter.addWidget(self.dust_panel)
+        self._sidebar_panels = {"left": self.file_panel, "right": self.dust_panel}
+        self._sidebar_widths = {"left": 205, "right": 310}
+        self._sidebar_handles = {"left": splitter.handle(1), "right": splitter.handle(2)}
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([205, 890, 310])
 
@@ -373,21 +405,81 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.lbl_status_info)
         status.addPermanentWidget(self.lbl_status_dust)
 
+    def _setup_retouch_toolbar(self):
+        toolbar = QFrame()
+        toolbar.setObjectName("canvasTools")
+        toolbar.setAccessibleName("手动修图工具")
+        self.retouch_toolbar = toolbar
+        layout = QHBoxLayout(toolbar)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(3)
+        label = QLabel("手动修图")
+        label.setObjectName("subtitleLabel")
+        layout.addWidget(label)
+        for mode, title, hint in (
+            ("clone", "仿制图章", "Option/Alt + 点击设置取样点，然后在目标处点击或拖画"),
+            ("spot", "污点修复", "点击污点或沿着划痕拖画，用周围像素修补笔迹覆盖区域"),
+        ):
+            button = self._tool(title, hint, checkable=True)
+            button.setObjectName("canvasToolBtn")
+            button.setAccessibleName(title)
+            button.setProperty("mode", mode)
+            self.edit_group.addButton(button)
+            self.edit_buttons[mode] = button
+            layout.addWidget(button)
+        layout.addStretch()
+
+        self.retouch_radius = QSpinBox()
+        self.retouch_hardness = QSpinBox()
+        self.retouch_opacity = QSpinBox()
+        for spin, title, tip, limits, value, suffix in (
+            (self.retouch_radius, "半径", "工具半径（原图像素） · [ 缩小 / ] 放大", (1, 512), 14, " px"),
+            (self.retouch_hardness, "硬度", "降低硬度可让笔刷边缘渐变", (0, 100), 70, "%"),
+            (self.retouch_opacity, "不透明度", "降低不透明度可保留部分原图", (1, 100), 100, "%"),
+        ):
+            spin.setRange(*limits)
+            spin.setValue(value)
+            spin.setPrefix(title + " ")
+            spin.setSuffix(suffix)
+            spin.setAccessibleName(title)
+            spin.setToolTip(tip)
+            spin.hide()
+            layout.addWidget(spin)
+        self.retouch_radius.valueChanged.connect(self._on_retouch_radius_changed)
+        return toolbar
+
     def _action(self, menu, label, callback, shortcut=None):
         action = QAction(label, self)
-        if shortcut is not None:
+        if isinstance(shortcut, QKeySequence.StandardKey):
+            action.setShortcuts(shortcut)
+        elif shortcut is not None:
             action.setShortcut(shortcut)
         action.triggered.connect(callback)
         menu.addAction(action)
         return action
 
+    def _button_shortcut(self, menu, label, button, shortcut):
+        action = self._action(menu, label, button.click, shortcut)
+        self._shortcut_buttons[button] = action
+        tip = button.toolTip() or label
+        button.setToolTip(f"{tip} · {action.shortcut().toString(QKeySequence.NativeText)}")
+
     def _setup_menu(self):
+        self._shortcut_buttons = {}
         file_menu = self.menuBar().addMenu("文件")
         self._action(file_menu, "添加照片…", self._on_open_files, QKeySequence.StandardKey.Open)
         self._action(file_menu, "打开文件夹…", self._on_open_directory, "Ctrl+Shift+O")
+        self.reveal_photo_action = self._action(file_menu, "打开照片所在位置",
+                                                lambda: self._reveal_photo(self._current_filepath))
+        self.reset_photo_action = self._action(file_menu, "重置当前照片…",
+                                               lambda: self._reset_photo(self._current_filepath))
+        self.remove_photo_action = self._action(file_menu, "从列表移除当前照片",
+                                                lambda: self._remove_photo(self._current_filepath))
+        self.clear_photos_action = self._action(file_menu, "清空照片列表", self._clear_photos)
+        file_menu.addSeparator()
         self.export_action = self._action(file_menu, "导出修复结果…", self._on_export,
                                           QKeySequence.StandardKey.Save)
-        self.batch_scan_action = self._action(file_menu, "批量扫描…", self._show_scan_queue)
+        self.batch_scan_action = self._action(file_menu, "批量扫描…", self._show_scan_queue, "Ctrl+Shift+Return")
         self.retry_scan_action = self._action(file_menu, "重试失败的扫描", self._retry_batch_scan)
         self.batch_export_action = self._action(
             file_menu, "批量导出…", self._on_export_all, "Ctrl+Shift+S"
@@ -396,57 +488,143 @@ class MainWindow(QMainWindow):
         self.ir_fourth_action = self._action(
             file_menu, "将当前 TIFF 的第四通道作为红外", self._attach_fourth_channel
         )
+        self._button_shortcut(file_menu, "上一张照片", self.btn_prev, "PgUp")
+        self._button_shortcut(file_menu, "下一张照片", self.btn_next, "PgDown")
         self._action(file_menu, "退出", self.close, QKeySequence.StandardKey.Quit)
 
         edit_menu = self.menuBar().addMenu("编辑")
         self.undo_action = self._action(edit_menu, "撤销", self._undo, QKeySequence.StandardKey.Undo)
         self.redo_action = self._action(edit_menu, "重做", self._redo, QKeySequence.StandardKey.Redo)
         self.repeat_action = self._action(edit_menu, "同卷重复候选…", self._show_repeated)
+        self._button_shortcut(edit_menu, "扫描缺陷", self.dust_panel.btn_detect, "Ctrl+Return")
+        self._button_shortcut(edit_menu, "修复所选", self.dust_panel.btn_remove, "Ctrl+R")
+        self._button_shortcut(edit_menu, "忽略所选", self.dust_panel.btn_ignore_selected, "Ctrl+Shift+I")
+        self._button_shortcut(edit_menu, "勾选可见候选", self.dust_panel.btn_check_visible, "Ctrl+Shift+A")
+        self._button_shortcut(edit_menu, "清空可见候选的勾选", self.dust_panel.btn_uncheck_visible, "Ctrl+Shift+D")
+
+        tool_menu = self.menuBar().addMenu("工具")
+        for mode, shortcut in ((None, "V"), ("detect", "Q"), ("draw", "P"), ("check", "G"),
+                               ("ignore", "X"), ("repair", "E"), ("clone", "S"), ("spot", "H")):
+            button = self.edit_buttons[mode]
+            self._button_shortcut(tool_menu, button.accessibleName(), button, shortcut)
+        tool_menu.addSeparator()
+        self._radius_actions = (
+            self._action(tool_menu, "缩小工具半径", lambda: self._step_tool_radius(-1), "["),
+            self._action(tool_menu, "放大工具半径", lambda: self._step_tool_radius(1), "]"),
+        )
 
         view_menu = self.menuBar().addMenu("视图")
-        self._action(view_menu, "前后对比", self.btn_compare.click, "B")
-        self._action(view_menu, "切换候选标记", self.btn_marks.click, "M")
+        self._button_shortcut(view_menu, "前后对比", self.btn_compare, "B")
+        self._comparison_actions = []
+        for mode, shortcut in (("wipe", "Ctrl+1"), ("side", "Ctrl+2"), ("stack", "Ctrl+3")):
+            action = self._action(view_menu, self.compare_buttons[mode].text(),
+                                  lambda _, value=mode: self._show_comparison_layout(value), shortcut)
+            self._comparison_actions.append(action)
+        self._button_shortcut(view_menu, "切换候选标记", self.btn_marks, "M")
         self._action(view_menu, "上一处候选", lambda: self._step_candidate(-1), "K")
         self._action(view_menu, "下一处候选", lambda: self._step_candidate(1), "J")
         self._action(view_menu, "原图核对候选", self._refine_current_candidate, "R")
         self._action(view_menu, "切换显尘", self.dust_panel.btn_dust_view.click, "D")
-        self._action(view_menu, "适应窗口", self.image_viewer.fit_to_window, "F")
-        self._action(view_menu, "原始像素", self.image_viewer.zoom_100, "1")
-        self._action(view_menu, "搜索照片", lambda: self.file_panel.search.setFocus(), QKeySequence.StandardKey.Find)
+        self._button_shortcut(view_menu, "切换三联预览", self.dust_panel.btn_trial, "T")
+        self._button_shortcut(view_menu, "缩小画布", self.btn_zoom_out, "-")
+        self._button_shortcut(view_menu, "放大画布", self.btn_zoom_in, "=")
+        self._button_shortcut(view_menu, "适应窗口", self.btn_fit, "F")
+        self._button_shortcut(view_menu, "原始像素", self.btn_100, "1")
+        self._action(view_menu, "搜索照片", self._focus_photo_search, QKeySequence.StandardKey.Find)
+        self.focus_view_action = self._action(view_menu, "切换专注视图", self._toggle_focus_view, "Ctrl+Shift+F")
         self.theme_action = self._action(view_menu, "切换明暗主题", self._on_toggle_theme, "Ctrl+T")
+
+        help_menu = self.menuBar().addMenu("说明")
+        self._action(help_menu, "键盘快捷键…", self._show_shortcuts, "F1")
+        self._shortcut_menus = (file_menu, edit_menu, tool_menu, view_menu, help_menu)
+
+    def _show_shortcuts(self):
+        dialog = QDialog(self)
+        dialog.setObjectName("exportDialog")
+        dialog.setWindowTitle("键盘快捷键")
+        dialog.resize(500, 560)
+        layout = QVBoxLayout(dialog)
+        tree = QTreeWidget()
+        tree.setObjectName("shortcutList")
+        tree.setHeaderLabels(["操作", "快捷键"])
+        tree.setColumnWidth(0, 250)
+        layout.addWidget(tree)
+        for menu in self._shortcut_menus:
+            section = QTreeWidgetItem(tree, [menu.title()])
+            for action in menu.actions():
+                keys = [key.toString(QKeySequence.NativeText) for key in action.shortcuts() if not key.isEmpty()]
+                if keys:
+                    QTreeWidgetItem(section, [action.text().rstrip("…"), " / ".join(keys)])
+        gestures = QTreeWidgetItem(tree, ["画布操作"])
+        alt = "Option" if sys.platform == "darwin" else "Alt"
+        for label, keys in (("临时抓手", "按住空格并拖动"), ("仿制图章取样", f"{alt} + 点击"),
+                            ("追加框选勾选", "Shift + 拖框"), ("缩放", "滚轮或触控板捏合")):
+            QTreeWidgetItem(gestures, [label, keys])
+        tree.expandAll()
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("关闭")
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _setup_loading(self):
         self.overlay = QFrame(self)
         self.overlay.setObjectName("loadingOverlay")
         layout = QVBoxLayout(self.overlay)
-        layout.setAlignment(Qt.AlignCenter)
         card = QFrame()
         card.setObjectName("loadingCard")
-        card.setMinimumWidth(270)
+        card.setFixedWidth(360)
         contents = QVBoxLayout(card)
-        contents.setContentsMargins(26, 20, 26, 20)
-        contents.setSpacing(12)
-        contents.addWidget(BusySpinner(), alignment=Qt.AlignHCenter)
+        contents.setContentsMargins(18, 15, 18, 15)
+        contents.setSpacing(9)
+
+        heading = QHBoxLayout()
+        heading.setSpacing(9)
+        heading.addWidget(BusySpinner(), alignment=Qt.AlignTop)
         self.overlay_label = QLabel()
-        self.overlay_label.setAlignment(Qt.AlignCenter)
         self.overlay_label.setObjectName("loadingLabel")
-        contents.addWidget(self.overlay_label)
+        self.overlay_label.setWordWrap(True)
+        heading.addWidget(self.overlay_label, 1)
+        contents.addLayout(heading)
+
+        self.overlay_meter = QWidget()
+        meter = QHBoxLayout(self.overlay_meter)
+        meter.setContentsMargins(0, 0, 0, 0)
+        meter.setSpacing(10)
         self.overlay_bar = QProgressBar()
-        self.overlay_bar.hide()
-        contents.addWidget(self.overlay_bar)
+        self.overlay_bar.setObjectName("loadingProgress")
+        self.overlay_bar.setFixedHeight(6)
+        self.overlay_bar.setTextVisible(False)
+        meter.addWidget(self.overlay_bar, 1)
+        self.overlay_percent = QLabel()
+        self.overlay_percent.setObjectName("loadingPercent")
+        self.overlay_percent.setFixedWidth(36)
+        self.overlay_percent.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        meter.addWidget(self.overlay_percent)
+        self.overlay_meter.hide()
+        contents.addWidget(self.overlay_meter)
+
         self.overlay_cancel = QPushButton("当前文件完成后停止")
+        self.overlay_cancel.setObjectName("secondaryBtn")
         self.overlay_cancel.clicked.connect(self._cancel_export)
         self.overlay_cancel.hide()
-        contents.addWidget(self.overlay_cancel)
-        layout.addWidget(card)
+        contents.addWidget(self.overlay_cancel, alignment=Qt.AlignRight)
+        layout.addWidget(card, alignment=Qt.AlignCenter)
         self.overlay.hide()
 
     def _connect_signals(self):
         self.theme_manager.theme_changed.connect(self._update_canvas_icons)
+        for side, button in self._sidebar_buttons.items():
+            button.toggled.connect(lambda visible, value=side: self._toggle_sidebar(value, visible))
+            self._sidebar_header_buttons[side].clicked[bool].connect(button.setChecked)
+        self.centralWidget().splitterMoved.connect(self._remember_sidebar_widths)
         self.file_panel.open_photos.connect(self._on_open_files)
         self.file_panel.open_directory.connect(self._on_open_directory)
         self.file_panel.file_selected.connect(self._on_file_selected)
         self.file_panel.directory_loaded.connect(self._on_directory_loaded)
+        self.file_panel.btn_clear.clicked.connect(self._clear_photos)
+        self.file_panel.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_panel.file_list.customContextMenuRequested.connect(self._photo_context_menu)
         self.dust_panel.btn_detect.clicked.connect(self._on_detect_dust)
         self.dust_panel.btn_batch_scan.clicked.connect(self._show_scan_queue)
         self.dust_panel.btn_refine.clicked.connect(self._refine_current_candidate)
@@ -471,6 +649,7 @@ class MainWindow(QMainWindow):
         self.image_viewer.annotation_right_clicked.connect(self._on_annotation_right_clicked)
         self.image_viewer.region_selected.connect(self._on_region_selected)
         self.image_viewer.stroke_drawn.connect(self._on_stroke_drawn)
+        self.image_viewer.sample_requested.connect(self._sample_retouch)
         self.edit_group.buttonToggled.connect(self._on_edit_mode_changed)
         self.brush_radius.valueChanged.connect(self._on_brush_radius_changed)
         self.image_viewer.view_changed.connect(self._queue_view)
@@ -490,8 +669,35 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         kind = event.type()
+        if kind in (QEvent.Move, QEvent.Resize) and watched in (
+            self.centralWidget(), self._canvas_viewports, *self._sidebar_handles.values()
+        ):
+            self._position_sidebar_buttons()
+        if kind == QEvent.EnabledChange:
+            action = self._shortcut_buttons.get(watched)
+            if action is not None:
+                action.setEnabled(watched.isEnabled())
         if kind == QEvent.WindowDeactivate and watched is self:
             self._set_space_pan(False)
+            self.image_viewer.set_sampling_cursor(False)
+        if (kind in (QEvent.ShortcutOverride, QEvent.KeyPress)
+                and isinstance(watched, (QAbstractSpinBox, QLineEdit)) and watched.window() is self
+                and event.modifiers() == Qt.NoModifier and event.key() in (Qt.Key_BracketLeft, Qt.Key_BracketRight)):
+            control = self._tool_radius_control()
+            if control is not None and (watched is control or control.isAncestorOf(watched)):
+                action = self._radius_actions[0 if event.key() == Qt.Key_BracketLeft else 1]
+                if kind == QEvent.KeyPress:
+                    action.trigger()
+                event.accept()
+                return True
+        if (kind == QEvent.ShortcutOverride and isinstance(watched, (QLineEdit, QAbstractSpinBox))
+                and watched.window() is self and event.text().isprintable()
+                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
+            event.accept()
+            return True
+        if (kind in (QEvent.KeyPress, QEvent.KeyRelease) and event.key() == Qt.Key_Alt
+                and isinstance(watched, QWidget) and watched.window() is self):
+            self.image_viewer.set_sampling_cursor(kind == QEvent.KeyPress)
         if (kind not in (QEvent.ShortcutOverride, QEvent.KeyPress, QEvent.KeyRelease)
                 or event.key() != Qt.Key_Space or self._current_image is None):
             return super().eventFilter(watched, event)
@@ -521,6 +727,12 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         self.theme_manager.set_theme(self.config.get("theme", "dark"))
         self.resize(self.config.get("window.width", 1400), self.config.get("window.height", 900))
+        for side, panel in self._sidebar_panels.items():
+            width = self.config.get(f"sidebars.{side}.width", self._sidebar_widths[side])
+            if isinstance(width, int):
+                self._sidebar_widths[side] = min(panel.maximumWidth(), max(panel.minimumWidth(), width))
+            self._sidebar_buttons[side].setChecked(not self.config.get(f"sidebars.{side}.collapsed", False))
+        self._layout_sidebars()
         try:
             manifest, snapshots = self._workspace.load()
             self._restore_workspace_states(snapshots)
@@ -530,9 +742,10 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError, TypeError, BadZipFile, sqlite3.Error) as error:
             self.lbl_status_file.setText(f"工作区恢复失败 · {error}")
             manifest = {}
-        if manifest.get("paths"):
-            self._resume_path = manifest.get("active")
-            QTimer.singleShot(0, lambda: self.file_panel.load_files(manifest["paths"]))
+        if "paths" in manifest:
+            if manifest["paths"]:
+                self._resume_path = manifest.get("active")
+                QTimer.singleShot(0, lambda: self.file_panel.load_files(manifest["paths"], keep_missing=True))
             return
         last = self.config.get("last_directory", "")
         if last and Path(last).is_dir():
@@ -553,13 +766,18 @@ class MainWindow(QMainWindow):
                     self._next_revision = max(self._next_revision, command.new_revision + 1)
                 history.setIndex(state["index"])
                 history.blockSignals(False)
+                repaired = state.get("repaired_marks")
+                if repaired is None:
+                    repaired = [(command.new_revision, command.repaired_items())
+                                for index in range(history.index())
+                                if (command := history.command(index)).patch is not None]
                 self._next_revision = max(self._next_revision, state["revision"] + 1)
                 self._photos[path] = PhotoState(
                     tuple(state["stamp"]) if state["stamp"] else None, history,
                     state["candidates"], state["ignored"], state["patches"],
                     state["revision"], state["exported_revision"], state["scan_source"],
                     tuple(state["ir_override"]) if state["ir_override"] else None,
-                    state.get("view"), state.get("size"),
+                    state.get("view"), state.get("size"), dict(repaired),
                 )
         finally:
             self._restoring_workspace = False
@@ -579,6 +797,7 @@ class MainWindow(QMainWindow):
             "exported_revision": state.exported_revision, "scan_source": state.scan_source,
             "ir_override": state.ir_override, "view": state.view, "size": state.size,
             "commands": commands, "index": state.history.index(),
+            "repaired_marks": list(state.repaired_marks.items()),
         }
 
     def _queue_workspace(self, path=None):
@@ -617,23 +836,35 @@ class MainWindow(QMainWindow):
         self.config.set("theme", self.theme_manager.current_theme)
         self.config.set("window.width", self.width())
         self.config.set("window.height", self.height())
+        self.config.set("sidebars", {side: {"width": self._sidebar_widths[side], "collapsed": panel.isHidden()}
+                                     for side, panel in self._sidebar_panels.items()})
         if self._current_filepath:
             self.config.set("last_directory", str(Path(self._current_filepath).parent))
         self.config.save()
 
     def _refresh_controls(self, *_args):
         has_image = self._current_image is not None
+        has_photos = bool(self.file_panel.photo_paths())
         is_tiff = self._current_filepath and Path(self._current_filepath).suffix.lower() in TIFF_EXTENSIONS
         busy = self._job is not None
+        self.focus_view_action.setEnabled(not busy)
+        for button in self._sidebar_buttons.values():
+            button.setEnabled(not busy)
         for control in (self.btn_fit, self.btn_zoom_in, self.btn_zoom_out, self.btn_100,
-                        self.edit_toolbar, self.brush_radius, self.btn_marks, self.dust_panel.btn_detect):
+                        self.edit_toolbar, self.retouch_toolbar, self.brush_radius, self.btn_marks,
+                        self.dust_panel.btn_detect):
             control.setEnabled(has_image and not busy)
         for controls, enabled in (
-            ((self.btn_compare,), self._revision != 0),
+            ((self.btn_compare, *self._comparison_actions), self._revision != 0),
+            ((self.btn_prev, self.btn_next), has_photos),
+            ((self.dust_panel.btn_check_visible, self.dust_panel.btn_uncheck_visible), has_image),
             ((self.dust_panel.btn_export, self.export_action, self.ir_action), has_image),
+            ((self.remove_photo_action, self.reveal_photo_action), has_image and has_photos),
+            ((self.reset_photo_action,), self._can_reset_photo(self._current_filepath)),
+            ((self.clear_photos_action, self.file_panel.btn_clear), has_photos),
             ((self.ir_fourth_action,), bool(is_tiff)),
             ((self.batch_export_action, self.batch_scan_action, self.dust_panel.btn_batch_scan),
-             bool(self.file_panel.photo_paths()) or has_image),
+             has_photos or has_image),
             ((self.retry_scan_action,), bool(self._failed_scan_paths)),
             ((self.repeat_action,), len(self.file_panel.photo_paths()) >= 3),
             ((self.btn_undo, self.undo_action), self._history.canUndo()),
@@ -641,9 +872,12 @@ class MainWindow(QMainWindow):
         ):
             for control in controls:
                 control.setEnabled(enabled and not busy)
+        for button, action in self._shortcut_buttons.items():
+            action.setEnabled(button.isEnabled())
+        self._refresh_radius_actions()
 
     def _start_job(self, label, work, completed, *, on_error=None, on_item=None,
-                   cancel_label="当前文件完成后停止"):
+                   cancel_label="当前文件完成后停止", show_overlay=True):
         if self._job is not None:
             return
         job = WorkspaceJob(work, self, stream=on_item is not None)
@@ -659,13 +893,14 @@ class MainWindow(QMainWindow):
         self.centralWidget().setEnabled(False)
         self._refresh_controls()
         self.overlay_label.setText(label)
-        self.overlay_bar.hide()
+        self.overlay_meter.hide()
         self.overlay_cancel.setText(cancel_label)
         self.overlay_cancel.setVisible(self._export_cancel is not None)
         self.overlay_cancel.setEnabled(True)
         self.overlay.setGeometry(self.rect())
-        self.overlay.raise_()
-        self.overlay.show()
+        if show_overlay:
+            self.overlay.raise_()
+            self.overlay.show()
         job.start()
 
     def _finish_job(self):
@@ -678,7 +913,8 @@ class MainWindow(QMainWindow):
     def _update_progress(self, done, total):
         self.overlay_bar.setRange(0, total)
         self.overlay_bar.setValue(done)
-        self.overlay_bar.show()
+        self.overlay_percent.setText(self.overlay_bar.text())
+        self.overlay_meter.show()
 
     def _cancel_export(self):
         if self._export_cancel is not None:
@@ -688,7 +924,7 @@ class MainWindow(QMainWindow):
     def _show_error(self, message):
         self.overlay.hide()
         self.lbl_status_file.setText("操作未完成")
-        QMessageBox.warning(self, "FilmClear", message)
+        NoticeDialog(self, "操作未完成", message, warning=True).exec()
 
     def _on_open_files(self):
         if self._job is not None:
@@ -719,6 +955,134 @@ class MainWindow(QMainWindow):
             return str(Path(self._current_filepath).parent)
         return str(Path.home())
 
+    def _photo_context_menu(self, position):
+        if self._job is not None:
+            return
+        photos = self.file_panel.file_list
+        path = self.file_panel.photo_at(photos.indexAt(position).row())
+        if path is None:
+            return
+        menu = QMenu(self)
+        reveal = menu.addAction("打开所在位置")
+        reset = menu.addAction("重置照片…")
+        reset.setEnabled(self._can_reset_photo(path))
+        remove = menu.addAction("从列表移除此照片")
+        chosen = menu.exec(photos.viewport().mapToGlobal(position))
+        if chosen is reveal:
+            self._reveal_photo(path)
+        elif chosen is reset:
+            self._reset_photo(path)
+        elif chosen is remove:
+            self._remove_photo(path)
+
+    def _reveal_photo(self, path):
+        if path is None:
+            return
+        path = Path(path)
+        if path.is_file() and sys.platform == "darwin":
+            opened, _ = QProcess.startDetached("/usr/bin/open", ["-R", str(path)])
+        elif path.is_file() and sys.platform == "win32":
+            opened, _ = QProcess.startDetached("explorer.exe", ["/select,", str(path)])
+        else:
+            opened = path.parent.is_dir() and QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+        if not opened:
+            self.lbl_status_file.setText("无法打开照片所在位置")
+
+    def _can_reset_photo(self, path):
+        if path is None:
+            return False
+        if path == self._current_filepath:
+            return bool(self._history.count() or self._scan_source or self._revision
+                        or self._dust_items or self._ignored_items)
+        state = self._photos.get(path)
+        return bool(state and (state.history.count() or state.scan_source or state.revision
+                               or state.candidates or state.ignored))
+
+    def _reset_photo(self, path):
+        if self._job is not None or not self._can_reset_photo(path):
+            return
+        name = Path(path).name
+        answer = NoticeDialog(
+            self, "重置照片",
+            f"将重置 {name} 的扫描和修复。\n撤销历史会清空，原片及已导出的文件会保留。",
+            confirm="重置照片",
+        ).exec()
+        if not answer:
+            return
+        active = path == self._current_filepath
+        if active:
+            self._stash_current(schedule=False)
+        state = self._photos[path]
+        state.history.clear()
+        reset = replace(state, candidates=[], ignored=[], patches=[], repaired_marks={},
+                        revision=0, exported_revision=0, scan_source="")
+        if active:
+            scan = Scan(self._original_image, self._infrared, self._ir_source)
+            self._show_photo(path, scan.image, scan=scan, stamp=state.stamp, restored=reset)
+            self._stash_current(schedule=False)
+        else:
+            self._photos[path] = reset
+            self._update_file_status(path, reset)
+        self._failed_scan_paths = [failed for failed in self._failed_scan_paths if failed != path]
+        self._queue_workspace(path)
+        if self._save_workspace():
+            next_step = "可重新扫描" if active or Path(path).is_file() else "等待原片重新连接"
+            self.lbl_status_file.setText(f"已重置 {name} · {next_step}")
+        self._refresh_controls()
+
+    def _remove_photo(self, path):
+        if self._job is not None or path not in self.file_panel.photo_paths():
+            return
+        replacement = self.file_panel.remove_file(path)
+        self._failed_scan_paths = [failed for failed in self._failed_scan_paths if failed != path]
+        if path == self._current_filepath:
+            self._clear_current_photo()
+            self.file_panel.select_file(replacement, quiet=True)
+            if replacement is not None:
+                self._on_file_selected(replacement)
+        self._queue_workspace()
+        self._refresh_controls()
+        self.lbl_status_file.setText(f"已从列表移除 {Path(path).name}")
+
+    def _clear_photos(self):
+        count = len(self.file_panel.photo_paths())
+        if self._job is not None or not count:
+            return
+        if not NoticeDialog(self, "清空照片列表",
+                            f"将从列表移除全部 {count} 张照片。\n原片和修复记录会保留。",
+                            confirm="清空列表").exec():
+            return
+        self._failed_scan_paths.clear()
+        self.file_panel.load_files([])
+        self.file_panel.search.clear()
+        self.file_panel.filter_buttons["all"].setChecked(True)
+        self.lbl_status_file.setText("已清空照片列表")
+
+    def _clear_current_photo(self):
+        self._stash_current()
+        self._current_filepath = self._photo_stamp = None
+        self._current_image = self._original_image = self._infrared = None
+        self._ir_override = self._pinned_candidate = None
+        self._scan_source = self._ir_source = ""
+        self._revision = self._exported_revision = 0
+        self._history = self._new_history()
+        self._applied_patches = []
+        self._repaired_marks = {}
+        self._dust_items = []
+        self._ignored_items = []
+        self.btn_compare.setChecked(False)
+        self._toggle_comparison(False)
+        self.edit_buttons[None].setChecked(True)
+        self.image_viewer.clear_image()
+        self.dust_panel.set_infrared_available(False)
+        self.dust_panel.clear_list()
+        self.document_title.setText("胶片工作台")
+        self.document_title.setToolTip("")
+        self.lbl_status_info.clear()
+        self.lbl_status_info.setToolTip("")
+        self.lbl_status_dust.clear()
+        self.lbl_zoom.clear()
+
     def _load_directory(self, directory):
         if self._job is None:
             try:
@@ -730,27 +1094,29 @@ class MainWindow(QMainWindow):
         self._stash_current()
         if self._save_workspace():
             return True
-        box = QMessageBox(QMessageBox.Warning, "工作区尚未保存",
-                          "本地工作区保存失败。退出后可能丢失本次编辑。", parent=self)
-        discard = box.addButton("放弃本次修改", QMessageBox.DestructiveRole)
-        cancel = box.addButton("继续编辑", QMessageBox.RejectRole)
-        box.setDefaultButton(cancel)
-        box.exec()
-        return box.clickedButton() is discard
+        return bool(NoticeDialog(self, "工作区尚未保存", "本地工作区保存失败。退出后可能丢失本次编辑。",
+                                 confirm="放弃本次修改", cancel="继续编辑").exec())
 
     def _on_directory_loaded(self, files):
+        if self._current_filepath and self._current_filepath not in self.file_panel.photo_paths():
+            self._clear_current_photo()
         self._queue_workspace()
         for path in files:
             if path in self._photos:
                 self._update_file_status(path, self._photos[path])
-        if files:
-            path = self._resume_path if self._resume_path in files else files[0]
-            self._resume_path = None
+        path = self._resume_path
+        if path not in files or not Path(path).is_file():
+            path = next((candidate for candidate in files if Path(candidate).is_file()), None)
+        self._resume_path = None
+        if path:
             self.file_panel.reveal_file(path)
             self.file_panel.select_file(path, quiet=True)
             self._on_file_selected(path)
+        elif files:
+            self.lbl_status_file.setText("原片暂不可用 · 可右键重置已缓存的编辑")
         else:
             self.lbl_status_file.setText("文件夹中没有支持的照片")
+        self._refresh_controls()
 
     def _on_file_selected(self, path):
         path = str(Path(path).resolve())
@@ -799,6 +1165,7 @@ class MainWindow(QMainWindow):
             self._applied_patches, self._revision, self._exported_revision,
             self._scan_source, self._ir_override,
             self.image_viewer.view_position(), self.image_viewer.get_image_size(),
+            self._repaired_marks,
         )
         self._photos[self._current_filepath] = state
         if schedule:
@@ -818,7 +1185,10 @@ class MainWindow(QMainWindow):
             self.file_panel.set_photo_status(path, "未扫描", None)
 
     def _show_photo(self, path, image, *, scan=None, stamp=None, restored=None):
-        self._stash_current()
+        if self._current_filepath is None:
+            self._history.deleteLater()
+        else:
+            self._stash_current()
         stale = self._photos.get(path)
         self._current_filepath = path
         self._photo_stamp = stamp
@@ -836,6 +1206,7 @@ class MainWindow(QMainWindow):
         self._dust_items = restored.candidates if restored else []
         self._ignored_items = restored.ignored if restored else []
         self._applied_patches = restored.patches if restored else []
+        self._repaired_marks = restored.repaired_marks if restored else {}
         self._scan_source = restored.scan_source if restored else ""
         self._ir_override = restored.ir_override if restored else None
         self.btn_compare.setChecked(False)
@@ -915,6 +1286,68 @@ class MainWindow(QMainWindow):
             self._add_photos(paths)
         event.acceptProposedAction()
 
+    def _show_comparison_layout(self, mode):
+        self.compare_buttons[mode].setChecked(True)
+        if not self.btn_compare.isChecked():
+            self.btn_compare.click()
+
+    def _remember_sidebar_widths(self, *_args):
+        left, _, right = self.centralWidget().sizes()
+        for side, width in (("left", left), ("right", right)):
+            if width:
+                self._sidebar_widths[side] = width
+
+    def _layout_sidebars(self):
+        splitter = self.centralWidget()
+        left, right = (0 if panel.isHidden() else self._sidebar_widths[side]
+                       for side, panel in self._sidebar_panels.items())
+        handles = int(left > 0) + int(right > 0)
+        middle = max(1, splitter.width() - left - right - handles * splitter.handleWidth())
+        splitter.setSizes([left, middle, right])
+        self._position_sidebar_buttons()
+
+    def _position_sidebar_buttons(self):
+        splitter = self.centralWidget()
+        bounds = splitter.rect().translated(splitter.mapTo(self, QPoint()))
+        y = self._canvas_viewports.mapTo(self, self._canvas_viewports.rect().center()).y()
+        for side, button in self._sidebar_buttons.items():
+            handle = self._sidebar_handles[side]
+            if self._sidebar_panels[side].isHidden():
+                x = bounds.left() if side == "left" else bounds.right() - button.width() + 1
+            else:
+                x = handle.mapTo(self, handle.rect().center()).x() - button.width() // 2
+            button.move(x, y - button.height() // 2)
+
+    def _toggle_sidebar(self, side, visible):
+        panel = self._sidebar_panels[side]
+        panel.setVisible(visible)
+        self._update_sidebar_button(side)
+        self._layout_sidebars()
+
+    def _update_sidebar_button(self, side):
+        button = self._sidebar_buttons[side]
+        header_button = self._sidebar_header_buttons[side]
+        visible = button.isChecked()
+        name = "照片栏" if side == "left" else "缺陷检查栏"
+        label = ("收起" if visible else "展开") + name
+        header_button.setChecked(visible)
+        for control in (button, header_button):
+            control.setToolTip(label)
+            control.setAccessibleName(label)
+        direction = "left" if (side == "left") == visible else "right"
+        color = "#e5edf4" if self.theme_manager.is_dark else "#202a35"
+        button.setIcon(tool_icon(f"chevron-{direction}", color))
+        header_button.setIcon(tool_icon(f"sidebar-{side}", color))
+
+    def _toggle_focus_view(self):
+        visible = not any(button.isChecked() for button in self._sidebar_buttons.values())
+        for button in self._sidebar_buttons.values():
+            button.setChecked(visible)
+
+    def _focus_photo_search(self):
+        self._sidebar_buttons["left"].setChecked(True)
+        self.file_panel.search.setFocus()
+
     def _toggle_comparison(self, enabled):
         mode = self.compare_group.checkedButton().property("mode")
         paired = enabled and mode != "wipe"
@@ -945,6 +1378,7 @@ class MainWindow(QMainWindow):
             self.original_viewer.clear_image()
             if enabled:
                 self.image_viewer.set_comparison(self._original_image)
+        self._refresh_comparison_marks()
         self.image_viewer.viewport().update()
         self._syncing_comparison = False
 
@@ -988,9 +1422,21 @@ class MainWindow(QMainWindow):
 
     def _toggle_marks(self, enabled):
         self.image_viewer.set_show_all(enabled)
+        self.original_viewer.set_show_all(enabled)
+
+    def _refresh_comparison_marks(self):
+        if not self.btn_compare.isChecked():
+            return
+        marks = {item.center: item for batch in self._repaired_marks.values() for item in batch}
+        marks.update((item.center, item) for item in self._dust_items)
+        viewer = self.original_viewer if not self.original_viewer.isHidden() else self.image_viewer
+        viewer.set_original_marks(list(marks.values()))
 
     def _update_canvas_icons(self, theme):
         color = "#e5edf4" if theme == ThemeManager.DARK else "#202a35"
+        self.file_panel.update_icons(color, "#10251f" if theme == ThemeManager.DARK else "#ffffff")
+        for side in self._sidebar_buttons:
+            self._update_sidebar_button(side)
         for name, button in self._canvas_icons.items():
             button.setIconSize(QSize(13, 13))
             button.setIcon(tool_icon(name, color))
@@ -1006,15 +1452,97 @@ class MainWindow(QMainWindow):
         self.image_viewer.set_selection_mode(mode)
         if mode in ("check", "ignore", "repair"):
             self.btn_marks.setChecked(True)
+        if mode in RETOUCH_MODES:
+            self.dust_panel.layer_buttons["rgb"].setChecked(True)
+            self.dust_panel.btn_dust_view.setChecked(False)
+            if self._inspection_timer.isActive():
+                self._inspection_timer.stop()
+                self._update_inspection_view()
         self.brush_radius.setVisible(mode == "draw")
+        self.retouch_radius.setVisible(mode in RETOUCH_MODES)
+        self.retouch_hardness.setVisible(mode in RETOUCH_MODES)
+        self.retouch_opacity.setVisible(mode == "clone")
+        self._refresh_radius_actions()
         self.lbl_status_file.setText(button.toolTip() if mode else "就绪")
+
+    def _tool_radius_control(self):
+        mode = self.edit_group.checkedButton().property("mode")
+        if mode == "draw":
+            return self.brush_radius
+        if mode in RETOUCH_MODES:
+            return self.retouch_radius
+        return None
+
+    def _refresh_radius_actions(self):
+        enabled = (self._current_image is not None and self._job is None
+                   and self._tool_radius_control() is not None)
+        for action in self._radius_actions:
+            action.setEnabled(enabled)
+
+    def _step_tool_radius(self, direction):
+        control = self._tool_radius_control()
+        if control is None:
+            return
+        value = control.value()
+        target = round(value * 1.2 ** direction)
+        control.setValue(target if target != value else value + direction)
 
     def _on_brush_radius_changed(self, radius):
         self.image_viewer.brush_radius = radius
+        self.image_viewer.viewport().update()
 
     def _on_stroke_drawn(self, points):
-        radius = ceil(self.brush_radius.value() / self.image_viewer.transform().m11())
-        self._start_detection(brush=(points, radius))
+        mode = self.edit_group.checkedButton().property("mode")
+        if mode == "draw":
+            radius = ceil(self.brush_radius.value() / self.image_viewer.transform().m11())
+            self._start_detection(brush=(points, radius))
+        elif mode in RETOUCH_MODES:
+            self._retouch(mode, points)
+
+    def _on_retouch_radius_changed(self, radius):
+        self.image_viewer.retouch_radius = radius
+        self.image_viewer.viewport().update()
+
+    def _sample_retouch(self, point):
+        if self._current_image is None or self._job is not None:
+            return
+        self.image_viewer.clone_source = point
+        self.image_viewer.viewport().update()
+        self.lbl_status_file.setText("已设置仿制取样点 · 点击或拖动画笔复制像素")
+
+    def _retouch(self, mode, points):
+        image = self._current_image
+        if image is None or self._job is not None:
+            return
+        source = self.image_viewer.clone_source
+        if mode == "clone" and source is None:
+            self.lbl_status_file.setText("请先用 Option/Alt + 点击设置仿制取样点")
+            return
+        source = (source.x(), source.y()) if source is not None else None
+        radius = self.retouch_radius.value()
+        hardness = self.retouch_hardness.value() / 100
+        opacity = 1.0 if mode == "spot" else self.retouch_opacity.value() / 100
+        params = self.dust_panel.get_inpaint_params()
+        title = self.edit_buttons[mode].text()
+        before = list(self._dust_items)
+
+        def work(_progress):
+            patch, footprint = retouch_patch(image, points, radius, hardness, mode=mode,
+                                             opacity=opacity, source=source, repair_params=params)
+            resolved = covered_candidates(before, footprint, patch[0], image.shape[1]) if patch is not None else set()
+            return patch, [item for item in before if item.id not in resolved]
+
+        def commit(result):
+            patch, after = result
+            if patch is None:
+                self.lbl_status_file.setText(f"{title} · 这笔没有改变像素")
+                return
+            revision = self._next_revision
+            self._next_revision += 1
+            self._history.push(EditCommand(self, title, before, after, patch, revision))
+            self.lbl_status_file.setText(f"{title} · 已应用，可撤销")
+
+        self._start_job(f"正在应用{title}…", work, commit, show_overlay=False)
 
     def _on_detect_dust(self):
         self._start_detection()
@@ -1124,9 +1652,8 @@ class MainWindow(QMainWindow):
             if errors:
                 status += f" · {len(errors)} 张失败，可从文件菜单重试"
                 self.overlay.hide()
-                box = QMessageBox(QMessageBox.Warning, "批量扫描结果", status, parent=self)
-                box.setDetailedText("\n".join(f"{Path(path).name} · {reason}" for path, reason in errors))
-                box.exec()
+                details = "\n".join(f"{Path(path).name} · {reason}" for path, reason in errors)
+                NoticeDialog(self, "批量扫描结果", status, warning=True, details=details).exec()
             self.lbl_status_file.setText(status)
 
         self._start_job("正在准备批量扫描…", work, done, on_item=scanned, cancel_label="停止扫描")
@@ -1147,6 +1674,7 @@ class MainWindow(QMainWindow):
         if patch is not None:
             positions, _, after = patch
             state.patches.append((revision, positions, after))
+            state.repaired_marks[revision] = command.repaired_items()
             state.revision = revision
 
     def _merge_scan_review(self, items, existing, ignored):
@@ -1241,11 +1769,13 @@ class MainWindow(QMainWindow):
     def _refresh_candidates(self):
         self._pinned_candidate = None
         self.image_viewer.update_annotations(self._dust_items)
+        self._refresh_comparison_marks()
         self.dust_panel.update_dust_list(self._dust_items)
         self.lbl_status_dust.setText(f"{len(self._dust_items)} 个候选")
 
     def _refresh_marks(self, *_args):
         self.image_viewer.viewport().update()
+        self._refresh_comparison_marks()
         self._stash_current()
 
     def _on_dust_hovered(self, dust_id):
@@ -1347,7 +1877,7 @@ class MainWindow(QMainWindow):
             entries.append((path, state.size, state.candidates))
         groups = repeated_defects(entries)
         if not groups:
-            QMessageBox.information(self, "同卷重复候选", "没有发现同位置的重复候选。可先批量扫描同一卷。")
+            NoticeDialog(self, "同卷重复候选", "没有发现同位置的重复候选。可先批量扫描同一卷。").exec()
             return
         dialog = RepeatDialog(groups, self)
         if dialog.exec() != RepeatDialog.Accepted:
@@ -1417,9 +1947,7 @@ class MainWindow(QMainWindow):
             self.lbl_status_file.setText(status)
             if errors:
                 self.overlay.hide()
-                box = QMessageBox(QMessageBox.Warning, title, status, parent=self)
-                box.setDetailedText("\n".join(errors))
-                box.exec()
+                NoticeDialog(self, title, status, warning=True, details="\n".join(errors)).exec()
 
         self._start_job("正在修复重复候选…", work, done)
 
@@ -1447,13 +1975,15 @@ class MainWindow(QMainWindow):
 
         self._start_job("正在修复选中的缺陷…", lambda _: self._repair_patch(image, items, params), commit)
 
-    def _apply_edit(self, items, ignored, revision, patch, *, use_after):
+    def _apply_edit(self, items, ignored, revision, patch, *, use_after, repaired=()):
         if patch is not None:
             positions, before, after = patch
             if use_after:
                 self._applied_patches.append((revision, positions, after))
+                self._repaired_marks[revision] = repaired
             else:
                 self._applied_patches.pop()
+                self._repaired_marks.pop(self._revision, None)
             if revision == 0:
                 self._current_image = self._original_image
             else:
@@ -1580,12 +2110,10 @@ class MainWindow(QMainWindow):
             self.lbl_status_file.setText(status)
             self.overlay.hide()
             if errors or review_error:
-                box = QMessageBox(QMessageBox.Warning, "导出结果", status, parent=self)
                 details = [f"{path.name} · {reason}" for path, reason in errors]
                 if review_error:
                     details.append(f"对照页 · {review_error}")
-                box.setDetailedText("\n".join(details))
-                box.exec()
+                NoticeDialog(self, "导出结果", status, warning=True, details="\n".join(details)).exec()
 
         self._start_job("正在准备原图导出…", save, finished)
 

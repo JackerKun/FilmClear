@@ -10,16 +10,77 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, QTimer, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog, QMenu, QTreeWidget
 
 from config import Config
+from core.dust_item import DustItem
 from core.native_detector import NativeDustDetector
+from ui.image_viewer import RETOUCH_MODES
 from ui.main_window import MainWindow
+from ui.notice_dialog import NoticeDialog
 
 
 class WorkspaceTest(unittest.TestCase):
+    def test_sidebar_folding_preserves_widths_and_restores_layout(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):
+            window = MainWindow()
+            window.resize(1400, 900)
+            window.show()
+            app.processEvents()
+            splitter = window.centralWidget()
+            splitter.setSizes([240, 822, 330])
+            window._remember_sidebar_widths()
+            original = splitter.sizes()
+            left = window._sidebar_buttons["left"]
+            header_left = window._sidebar_header_buttons["left"]
+            for side, button in window._sidebar_buttons.items():
+                handle = window._sidebar_handles[side]
+                center = handle.mapTo(window, handle.rect().center())
+                self.assertAlmostEqual(button.geometry().center().x(), center.x(), delta=1)
+                self.assertIs(window.childAt(button.geometry().center()), button)
+            window.file_panel.search.setText("scan")
+            self.assertFalse(header_left.icon().isNull())
+            header_left.click()
+            app.processEvents()
+            self.assertTrue(window.file_panel.isHidden())
+            self.assertFalse(window.dust_panel.isHidden())
+            self.assertEqual(splitter.sizes()[2], original[2])
+            self.assertIn("展开", left.accessibleName())
+            self.assertFalse(left.isChecked())
+            self.assertEqual(header_left.toolTip(), left.toolTip())
+            self.assertFalse(left.icon().isNull())
+            self.assertEqual(left.x(), splitter.mapTo(window, QPoint()).x())
+
+            viewer = window.image_viewer
+            viewer.setFocus()
+            QTest.keyClick(viewer, Qt.Key_F, Qt.ControlModifier | Qt.ShiftModifier)
+            app.processEvents()
+            self.assertEqual(splitter.sizes(), [0, splitter.width(), 0])
+            right = window._sidebar_buttons["right"]
+            self.assertEqual(right.geometry().right(), splitter.mapTo(window, splitter.rect().topRight()).x())
+            QTest.keyClick(viewer, Qt.Key_F, Qt.ControlModifier)
+            app.processEvents()
+            self.assertTrue(window.file_panel.search.hasFocus())
+            self.assertTrue(header_left.isChecked())
+            self.assertEqual(window.file_panel.search.text(), "scan")
+            self.assertEqual(splitter.sizes()[0], original[0])
+            self.assertTrue(window.dust_panel.isHidden())
+            window.close()
+
+            window = MainWindow()
+            window.show()
+            app.processEvents()
+            self.assertFalse(window.file_panel.isHidden())
+            self.assertTrue(window.dust_panel.isHidden())
+            window._sidebar_buttons["right"].click()
+            app.processEvents()
+            self.assertTrue(window._sidebar_header_buttons["right"].isChecked())
+            self.assertEqual(window.centralWidget().sizes(), original)
+            window.close()
+
     def test_review_and_pixel_history(self):
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as directory:
@@ -55,6 +116,11 @@ class WorkspaceTest(unittest.TestCase):
             dust.selected = False
             window._dust_items[0].selected = False
             panel = window.file_panel
+            header_actions = (panel.btn_add_photos, panel.btn_open, panel.btn_clear)
+            for button in header_actions:
+                self.assertFalse(button.icon().isNull())
+                self.assertTrue(button.accessibleName())
+                self.assertEqual(button.y(), header_actions[0].y())
             panel.search.setText("TWO")
             self.assertTrue(panel.file_list.item(0).isHidden())
             self.assertFalse(panel.file_list.item(1).isHidden())
@@ -121,6 +187,75 @@ class WorkspaceTest(unittest.TestCase):
             window.show()
             window.centralWidget().setSizes([300, 350, 390])
             app.processEvents()
+
+            viewer = window.image_viewer
+            viewer.setFocus()
+            self.assertEqual(window.edit_buttons[None].text(), "指针")
+            viewer.zoom_100()
+            QTest.keyClick(viewer, Qt.Key_Equal)
+            self.assertAlmostEqual(viewer.transform().m11(), 1.2)
+            QTest.keyClick(viewer, Qt.Key_Minus)
+            self.assertAlmostEqual(viewer.transform().m11(), 1.0)
+            QTest.keyClick(viewer, Qt.Key_S)
+            self.assertEqual(viewer._selection_mode, "clone")
+            radius = window.retouch_radius.value()
+            QTest.keyClick(viewer, Qt.Key_BracketRight)
+            self.assertGreater(window.retouch_radius.value(), radius)
+            self.assertEqual(viewer.retouch_radius, window.retouch_radius.value())
+            QTest.keyClick(viewer, Qt.Key_BracketLeft)
+            self.assertEqual(window.retouch_radius.value(), radius)
+            window.retouch_radius.setFocus()
+            QTest.keyClick(window.retouch_radius.lineEdit(), Qt.Key_BracketRight)
+            self.assertGreater(window.retouch_radius.value(), radius)
+            QTest.keyClick(window.retouch_radius.lineEdit(), Qt.Key_BracketLeft)
+            self.assertEqual(window.retouch_radius.value(), radius)
+            viewer.setFocus()
+            QTest.keyClick(viewer, Qt.Key_P)
+            search_radius = window.brush_radius.value()
+            QTest.keyClick(viewer, Qt.Key_BracketRight)
+            self.assertGreater(window.brush_radius.value(), search_radius)
+            self.assertEqual(window.retouch_radius.value(), radius)
+            QTest.keyClick(viewer, Qt.Key_BracketLeft)
+            QTest.keyClick(viewer, Qt.Key_S)
+            panel.search.setFocus()
+            QTest.keyClicks(panel.search, "v[h]")
+            self.assertEqual(panel.search.text(), "v[h]")
+            self.assertEqual(viewer._selection_mode, "clone")
+            self.assertEqual(window.retouch_radius.value(), radius)
+            self.assertAlmostEqual(viewer.transform().m11(), 1.0)
+            panel.search.clear()
+            viewer.setFocus()
+            QTest.keyClick(viewer, Qt.Key_V)
+            self.assertIsNone(viewer._selection_mode)
+            self.assertEqual(viewer.viewport().cursor().shape(), Qt.ArrowCursor)
+            for key, mode in ((Qt.Key_2, "side"), (Qt.Key_1, "wipe")):
+                QTest.keyClick(viewer, key, Qt.ControlModifier)
+                self.assertTrue(window.btn_compare.isChecked())
+                self.assertTrue(window.compare_buttons[mode].isChecked())
+            QTest.keyClick(viewer, Qt.Key_B)
+            self.assertFalse(window.btn_compare.isChecked())
+
+            shortcuts = {}
+
+            def read_shortcuts():
+                dialog = app.activeModalWidget()
+                if dialog is not None:
+                    tree = dialog.findChild(QTreeWidget, "shortcutList")
+                    if tree is not None:
+                        for index in range(tree.topLevelItemCount()):
+                            section = tree.topLevelItem(index)
+                            shortcuts.update((section.child(i).text(0), section.child(i).text(1))
+                                             for i in range(section.childCount()))
+                    dialog.reject()
+
+            QTimer.singleShot(0, read_shortcuts)
+            QTest.keyClick(viewer, Qt.Key_F1)
+            self.assertEqual(shortcuts.get("缩小工具半径"), "[")
+            self.assertEqual(shortcuts.get("放大工具半径"), "]")
+            self.assertEqual(shortcuts.get("缩小画布"), "-")
+            self.assertEqual(shortcuts.get("放大画布"), "=")
+            self.assertEqual(shortcuts.get("指针"), "V")
+            self.assertIn("临时抓手", shortcuts)
             self.assertTrue(window.image_viewer._show_all)
             window.btn_marks.click()
             self.assertFalse(window.image_viewer._show_all)
@@ -129,8 +264,9 @@ class WorkspaceTest(unittest.TestCase):
             for button in (*window.edit_buttons.values(), window.btn_marks,
                            window.btn_fit, window.btn_zoom_in, window.btn_zoom_out):
                 self.assertFalse(button.icon().isNull())
-                self.assertAlmostEqual(button.geometry().center().y(),
-                                       window.btn_marks.geometry().center().y(), delta=1)
+                if button.parent() is window.edit_toolbar:
+                    self.assertAlmostEqual(button.geometry().center().y(),
+                                           window.btn_marks.geometry().center().y(), delta=1)
             for mode, button in window.edit_buttons.items():
                 self.assertTrue(button.isVisible())
                 self.assertGreaterEqual(button.width(), button.sizeHint().width())
@@ -139,6 +275,7 @@ class WorkspaceTest(unittest.TestCase):
                 self.assertIs(window.edit_group.checkedButton(), button)
                 self.assertEqual(window.image_viewer._selection_mode, mode)
                 self.assertEqual(window.brush_radius.isVisible(), mode == "draw")
+                self.assertEqual(window.retouch_radius.isVisible(), mode in RETOUCH_MODES)
 
             marks = np.full_like(image, 116)
             for center in ((45, 55), (141, 53)):
@@ -188,6 +325,13 @@ class WorkspaceTest(unittest.TestCase):
                 self.assertTrue(original.isVisible())
                 self.assertEqual(original.comparison_label, "原片")
                 self.assertEqual(edited.comparison_label, "修复后")
+                self.assertIn(dust.center, [mark.center for mark in original._before_marks])
+                before = original.viewport().grab().toImage()
+                after = edited.viewport().grab().toImage()
+                window.btn_marks.click()
+                self.assertNotEqual(original.viewport().grab().toImage(), before)
+                self.assertEqual(edited.viewport().grab().toImage(), after)
+                window.btn_marks.click()
                 if mode == "side":
                     self.assertLess(original.x(), edited.x())
                 else:
@@ -204,6 +348,13 @@ class WorkspaceTest(unittest.TestCase):
             self.assertTrue(window.original_viewer.isHidden())
             self.assertEqual(window.compare_slider.value(), 34)
             self.assertFalse(window.image_viewer._before.isNull())
+            for position in (0, 100):
+                window.compare_slider.setValue(position)
+                before = window.image_viewer.viewport().grab().toImage()
+                window.btn_marks.click()
+                after = window.image_viewer.viewport().grab().toImage()
+                self.assertEqual(before == after, position == 0)
+                window.btn_marks.click()
             window.btn_compare.click()
             self.assertTrue(window.compare_row.isHidden())
             first_history = window._history
@@ -230,7 +381,7 @@ class WorkspaceTest(unittest.TestCase):
             QTest.mouseMove(viewer.viewport(), center + QPoint(45, 0))
             self.assertLess(viewer.horizontalScrollBar().value(), scroll_before)
             QTest.keyRelease(viewer, Qt.Key_Space)
-            self.assertEqual(viewer.viewport().cursor().shape(), Qt.CrossCursor)
+            self.assertEqual(viewer.viewport().cursor().shape(), Qt.BlankCursor)
             QTest.mouseRelease(viewer.viewport(), Qt.LeftButton, pos=center + QPoint(45, 0))
             self.assertIsNone(window._job)
             self.assertTrue(draw.isChecked())
@@ -271,6 +422,9 @@ class WorkspaceTest(unittest.TestCase):
             self.assertEqual(window.file_panel.photo_paths(), [str(p.resolve()) for p in (first, second, third)])
             np.testing.assert_array_equal(window._current_image, final_pixels)
             self.assertAlmostEqual(window.image_viewer.view_position()[1], final_view[1])
+            window.btn_compare.click()
+            self.assertIn((85, 88), [mark.center for mark in window.image_viewer._before_marks])
+            window.btn_compare.click()
             window._undo()
             np.testing.assert_array_equal(window._current_image, image)
             self.assertEqual(window._dust_items[0].center, (85, 88))
@@ -284,4 +438,285 @@ class WorkspaceTest(unittest.TestCase):
             self.assertFalse(window._dust_items)
             self.assertEqual(window._revision, 0)
             self.assertIn("原图已变化", window.lbl_status_file.text())
+            window.close()
+
+    def test_removing_imports_keeps_edits_and_empty_workspace(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, third = (root / name for name in ("one.png", "two.png", "three.png"))
+            image = np.full((120, 140, 3), 116, np.uint8)
+            cv2.circle(image, (65, 59), 3, (224, 224, 224), cv2.FILLED)
+            for path in (first, second, third):
+                cv2.imwrite(str(path), image)
+
+            def create_window():
+                with patch("ui.main_window.Config", lambda: Config(directory)):
+                    window = MainWindow()
+                self.addCleanup(window._stop_workers)
+                return window
+
+            def finish_job(window):
+                deadline = time.monotonic() + 5
+                app.processEvents()
+                while window._job is not None and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                self.assertIsNone(window._job)
+
+            window = create_window()
+            window.file_panel.load_files([first, second, third])
+            finish_job(window)
+            first_path, second_path, third_path = (str(path.resolve()) for path in (first, second, third))
+            self.assertEqual(window._current_filepath, first_path)
+            window._on_detection_finished(NativeDustDetector(min_confidence=0.34).detect(image), None)
+            self.assertTrue(window._dust_items)
+            with patch("ui.main_window.sys.platform", "darwin"), patch(
+                "ui.main_window.QProcess.startDetached", return_value=(True, 42)
+            ) as reveal:
+                window.reveal_photo_action.trigger()
+                reveal.assert_called_once_with("/usr/bin/open", ["-R", first_path])
+
+            window._remove_photo(third_path)
+            self.assertEqual(window._current_filepath, first_path)
+            window.remove_photo_action.trigger()
+            finish_job(window)
+            self.assertEqual(window._current_filepath, second_path)
+            self.assertEqual(window.file_panel.photo_paths(), [second_path])
+            window.config.set("last_directory", directory)
+            prompts = []
+
+            def answer_clear(confirm):
+                box = app.activeModalWidget()
+                if isinstance(box, NoticeDialog):
+                    prompts.append((box.message_label.text(), box.cancel_button.isDefault()))
+                    if confirm:
+                        box.confirm_button.click()
+                    else:
+                        QTest.keyClick(box, Qt.Key_Return)
+
+            QTimer.singleShot(0, lambda: answer_clear(False))
+            window.file_panel.btn_clear.click()
+            self.assertEqual(window.file_panel.photo_paths(), [second_path])
+            self.assertEqual(window._current_filepath, second_path)
+            self.assertIn("1 张照片", prompts[0][0])
+            self.assertTrue(prompts[0][1])
+            QTimer.singleShot(0, lambda: answer_clear(True))
+            window.file_panel.btn_clear.click()
+            self.assertIsNone(window._current_filepath)
+            self.assertEqual(window.image_viewer.get_image_size(), (0, 0))
+            self.assertEqual(window.file_panel.photo_paths(), [])
+            self.assertTrue(all(path.is_file() for path in (first, second, third)))
+            window.close()
+
+            window = create_window()
+            finish_job(window)
+            self.assertEqual(window.file_panel.photo_paths(), [])
+            window._add_photos([first])
+            finish_job(window)
+            self.assertTrue(any(item.center == (65, 59) for item in window._dust_items))
+            window.close()
+
+    def test_reset_cached_repairs_with_and_without_original_available(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second = root / "one.png", root / "two.png"
+            hidden = root / "offline.png"
+            image = np.full((120, 140, 3), 116, np.uint8)
+            cv2.circle(image, (65, 59), 3, (224, 224, 224), cv2.FILLED)
+            for path in (first, second):
+                cv2.imwrite(str(path), image)
+            paths = [str(path.resolve()) for path in (first, second)]
+            detector = NativeDustDetector(min_confidence=0.34)
+
+            def open_window():
+                with patch("ui.main_window.Config", lambda: Config(directory)):
+                    window = MainWindow()
+                self.addCleanup(window._stop_workers)
+                window.show()
+                app.processEvents()
+                return window
+
+            def finish_job(window):
+                deadline = time.monotonic() + 5
+                while window._job is not None and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                self.assertIsNone(window._job)
+
+            def repair(window):
+                window._on_detection_finished(detector.detect(image), None)
+                window._on_remove_dust()
+                finish_job(window)
+                self.assertGreater(window._revision, 0)
+
+            window = open_window()
+            window.file_panel.load_files([first, second])
+            finish_job(window)
+            repair(window)
+            window.file_panel.select_file(second)
+            finish_job(window)
+            repair(window)
+            window.close()
+            second.rename(hidden)
+
+            window = open_window()
+            finish_job(window)
+            self.assertEqual(window.file_panel.photo_paths(), paths)
+            self.assertEqual(window._current_filepath, paths[0])
+            self.assertGreater(window._revision, 0)
+            self.assertTrue(window.reset_photo_action.isEnabled())
+            with patch("ui.main_window.NoticeDialog.exec", return_value=QDialog.Rejected):
+                window.reset_photo_action.trigger()
+            self.assertGreater(window._revision, 0)
+            with patch("ui.main_window.NoticeDialog.exec", return_value=QDialog.Accepted):
+                window.reset_photo_action.trigger()
+            np.testing.assert_array_equal(window._current_image, image)
+            self.assertEqual(window._history.count(), 0)
+            self.assertFalse(window._repaired_marks)
+            self.assertFalse(window._scan_source)
+            self.assertFalse(window.btn_compare.isEnabled())
+            repair(window)
+
+            photo_list = window.file_panel.file_list
+            position = photo_list.visualItemRect(photo_list.item(1)).center()
+
+            class ResetMenu(QMenu):
+                def exec(self, _):
+                    return next(action for action in self.actions()
+                                if action.text() == "重置照片…" and action.isEnabled())
+
+            with patch("ui.main_window.QMenu", ResetMenu), patch(
+                "ui.main_window.NoticeDialog.exec", return_value=QDialog.Accepted
+            ):
+                window._photo_context_menu(position)
+            self.assertGreater(window._revision, 0)
+            self.assertEqual(window._photos[paths[1]].revision, 0)
+            self.assertFalse(window._photos[paths[1]].patches)
+            self.assertFalse(second.exists())
+            window.close()
+
+            hidden.rename(second)
+            window = open_window()
+            finish_job(window)
+            self.assertGreater(window._revision, 0)
+            window.file_panel.select_file(second)
+            finish_job(window)
+            np.testing.assert_array_equal(window._current_image, image)
+            np.testing.assert_array_equal(cv2.imread(str(second)), image)
+            self.assertEqual(window._history.count(), 0)
+            self.assertFalse(window._scan_source)
+            self.assertFalse(window.reset_photo_action.isEnabled())
+            repair(window)
+            window.close()
+
+    def test_manual_retouch_gestures_save_export_and_undo_native_pixels(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "scan.png"
+            image = np.full((120, 160, 3), (13000, 17000, 21000), np.uint16)
+            for x in range(15, 50):
+                image[22:37, x] = (30000 + 203 * x, 25001 + 71 * x, 39999)
+            image[74:77, 99:116] = 61000
+            self.assertTrue(cv2.imwrite(str(path), image))
+
+            def open_window():
+                with patch("ui.main_window.Config", lambda: Config(directory)):
+                    window = MainWindow()
+                self.addCleanup(window._stop_workers)
+                window.show()
+                app.processEvents()
+                return window
+
+            def finish_job(window):
+                deadline = time.monotonic() + 5
+                while window._job is not None and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                self.assertIsNone(window._job)
+
+            window = open_window()
+            window.file_panel.load_files([path])
+            finish_job(window)
+            viewer = window.image_viewer
+            viewer.zoom_100()
+            window.retouch_radius.setValue(6)
+            window.retouch_hardness.setValue(100)
+            viewport = viewer.viewport()
+
+            def at(x, y):
+                return viewer.mapFromScene(QPointF(x, y))
+
+            self.assertNotIn("paint", window.edit_buttons)
+            window.edit_buttons["clone"].click()
+            QTest.mouseMove(viewport, at(60, 45))
+            self.assertEqual(viewport.cursor().shape(), Qt.BlankCursor)
+            QTest.keyPress(viewport, Qt.Key_Alt)
+            self.assertEqual(viewport.cursor().shape(), Qt.CrossCursor)
+            QTest.keyRelease(viewport, Qt.Key_Alt)
+            self.assertEqual(viewport.cursor().shape(), Qt.BlankCursor)
+            small = viewport.grab().toImage()
+            window.retouch_radius.setValue(18)
+            large = viewport.grab().toImage()
+            self.assertNotEqual(small.pixelColor(at(78, 45)), large.pixelColor(at(78, 45)))
+            window.retouch_radius.setValue(6)
+            QTest.mouseClick(viewport, Qt.LeftButton, pos=at(60, 45))
+            self.assertEqual(window._revision, 0)
+            QTest.mouseClick(viewport, Qt.LeftButton, Qt.AltModifier, at(23, 29))
+            self.assertEqual(window._revision, 0)
+            window.retouch_opacity.setValue(50)
+            QTest.mouseClick(viewport, Qt.LeftButton, pos=at(35, 85))
+            finish_job(window)
+            expected = np.rint((image[29, 23].astype(float) + image[85, 35]) / 2)
+            np.testing.assert_array_equal(window._current_image[85, 35], expected)
+            np.testing.assert_array_equal(window._current_image[85, 42], image[85, 42])
+            window._undo()
+            np.testing.assert_array_equal(window._current_image, image)
+            window._redo()
+            np.testing.assert_array_equal(window._current_image[85, 35], expected)
+
+            window.retouch_opacity.setValue(100)
+            QTest.mousePress(viewport, Qt.LeftButton, pos=at(60, 45))
+            QTest.mouseMove(viewport, at(76, 45))
+            QTest.mouseRelease(viewport, Qt.LeftButton, pos=at(76, 45))
+            finish_job(window)
+            np.testing.assert_array_equal(window._current_image[45, 60:77], image[29, 23:40])
+            np.testing.assert_array_equal(window._current_image[29, 23:40], image[29, 23:40])
+
+            candidate = DustItem(1, 99, 74, 17, 3, 51, 107, 75, dust_type="scratch")
+            window._on_detection_finished([candidate], None)
+            window.edit_buttons["spot"].click()
+            QTest.keyClick(viewer, Qt.Key_BracketRight)
+            self.assertEqual(viewer.retouch_radius, 7)
+            QTest.keyClick(viewer, Qt.Key_BracketLeft)
+            self.assertEqual(viewer.retouch_radius, 6)
+            QTest.mouseMove(viewport, at(98, 75))
+            self.assertEqual(viewport.cursor().shape(), Qt.BlankCursor)
+            QTest.mousePress(viewport, Qt.LeftButton, pos=at(98, 75))
+            QTest.mouseRelease(viewport, Qt.LeftButton, pos=at(116, 75))
+            finish_job(window)
+            self.assertFalse(window._dust_items)
+            self.assertLess(int(window._current_image[75, 107].max()), 23000)
+            np.testing.assert_array_equal(window._current_image[69, 90:121], image[69, 90:121])
+            window.btn_compare.click()
+            self.assertIn(candidate.center, [mark.center for mark in viewer._before_marks])
+            window.btn_compare.click()
+            edited = window._current_image.copy()
+            output = root / "export"
+            window._start_export([str(path)], output, ".png", "edited")
+            finish_job(window)
+            np.testing.assert_array_equal(cv2.imread(str(output / "scan_clean.png"), cv2.IMREAD_UNCHANGED), edited)
+            np.testing.assert_array_equal(cv2.imread(str(path), cv2.IMREAD_UNCHANGED), image)
+            window.close()
+
+            window = open_window()
+            finish_job(window)
+            np.testing.assert_array_equal(window._current_image, edited)
+            window._undo()
+            self.assertEqual(window._dust_items[0].center, candidate.center)
+            self.assertEqual(int(window._current_image[75, 107, 0]), 61000)
+            window._redo()
+            np.testing.assert_array_equal(window._current_image, edited)
             window.close()

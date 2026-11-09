@@ -80,10 +80,42 @@ def _perforated_margins(gray):
     return margins
 
 
+def _dark_frame_margins(gray):
+    """Find the exposure window when cropped perforations merge with the border."""
+    if min(gray.shape) < 120:
+        return []
+    margins = []
+    strong = set()
+    for axis, plane in ((1, gray), (0, gray.T)):
+        depth, length = plane.shape
+        inset = length // 10
+        for end, oriented in ((False, plane), (True, plane[::-1])):
+            strip = oriented[:round(0.13 * depth), inset:-inset]
+            strip = cv2.blur(strip.astype(np.float32), (5, 3))
+            outside, inside = strip[:-4], strip[4:]
+            hits = (outside <= 18) & (inside >= 27) & (inside - outside >= 18)
+            votes = np.convolve(hits.mean(axis=1), np.ones(5), mode="same")
+            # Leave room to verify a dark band just outside the transition.
+            row = 7 + int(np.argmax(votes[7:]))
+            band = hits[row - 3:row + 4]
+            coverage = band.any(axis=0).mean()
+            dark_band = np.median(strip[max(0, row - 12):row - 3], axis=0) < 20
+            if coverage < 0.48 or dark_band.mean() < 0.78:
+                continue
+            # Keep the outer side of a slightly tilted transition in the search.
+            offset = row - 1 + np.percentile(np.nonzero(band)[0], 15)
+            margins.append((axis, end, depth - offset if end else offset))
+            if coverage >= 0.72:
+                strong.add((axis, end))
+    # Opposing, well-supported transitions distinguish a film frame from a
+    # single dark wall or a shadow that happens to touch an image edge.
+    return margins if any((axis, False) in strong and (axis, True) in strong for axis in (0, 1)) else []
+
+
 class SceneFocus:
     """Rate film candidates in the scene without changing their contours."""
 
-    def __init__(self, image):
+    def __init__(self, image, *, prioritize_subject=True):
         height, width = image.shape[:2]
         scale = min(1, 1000 / max(height, width))
         thumb = image if scale == 1 else cv2.resize(
@@ -92,10 +124,15 @@ class SceneFocus:
         )
         pixels = display_pixels(thumb)
         gray = cv2.cvtColor(pixels, cv2.COLOR_BGR2GRAY) if pixels.ndim == 3 else pixels
-        self.faces = _detect_faces(pixels)
-        self.margins = _perforated_margins(gray)
         h, w = gray.shape
+        self.shape = gray.shape
         self.factors = (w / width, h / height)
+        self.margins = _perforated_margins(gray) + _dark_frame_margins(gray)
+        self.faces = []
+        self.texture = None
+        if not prioritize_subject:
+            return
+        self.faces = _detect_faces(pixels)
         soft = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.2)
         dx = cv2.Sobel(soft, -1, 1, 0, ksize=3, scale=1 / 8)
         dy = cv2.Sobel(soft, -1, 0, 1, ksize=3, scale=1 / 8)
@@ -112,11 +149,14 @@ class SceneFocus:
 
     def filter(self, items, min_confidence):
         kept = []
-        h, w = self.texture.shape
+        h, w = self.shape
         sx, sy = self.factors
         for item in items:
             point = (min(w - 1, round(item.center_x * sx)), min(h - 1, round(item.center_y * sy)))
             if any((point[axis] >= boundary) == bottom for axis, bottom, boundary in self.margins):
+                continue
+            if self.texture is None:
+                kept.append(item)
                 continue
             x, y = point
             face = any(left - 0.08 * width <= x <= left + 1.08 * width

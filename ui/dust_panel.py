@@ -4,10 +4,10 @@ from dataclasses import replace
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, QTimer, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QButtonGroup, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -15,6 +15,22 @@ from core.dust_remover import DustRemover
 from core.scan_io import display_pixels
 
 from .image_viewer import photo_pixmap
+
+
+class InspectionComboBox(QComboBox):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("inspectionCombo")
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        x, y = self.width() - 14, self.height() / 2
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(self.palette().buttonText().color(), 1.5, Qt.SolidLine, Qt.RoundCap))
+        tip = QPointF(x, y + 2)
+        painter.drawLine(QPointF(x - 3.5, y - 1.5), tip)
+        painter.drawLine(tip, QPointF(x + 3.5, y - 1.5))
 
 
 class CandidatePreview(QWidget):
@@ -180,49 +196,40 @@ class DustPanel(QWidget):
         self._detected = False
         self._setup_ui()
 
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 12)
-        layout.setSpacing(6)
-        title = QLabel("缺陷检查")
-        title.setObjectName("titleLabel")
-        layout.addWidget(title)
+    def _scan_controls(self):
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        for column in range(4):
+            grid.setColumnStretch(column, 1)
 
-        controls = QHBoxLayout()
-        self.combo_sensitivity = QComboBox()
+        self.combo_sensitivity = InspectionComboBox()
         self.combo_sensitivity.addItem("精选候选", (20, 0.34))
         self.combo_sensitivity.addItem("均衡扫描", (20, 0.29))
         self.combo_sensitivity.addItem("细查微尘", (20, 0.25))
         self.combo_sensitivity.setToolTip("精选侧重减少误报，细查会列出更多弱响应。")
-        controls.addWidget(self.combo_sensitivity, 1)
-        self.btn_detect = QPushButton("扫描缺陷")
-        controls.addWidget(self.btn_detect)
-        self.btn_batch_scan = QPushButton("批量")
-        self.btn_batch_scan.setObjectName("secondaryBtn")
-        self.btn_batch_scan.setToolTip("选择照片并批量扫描")
-        controls.addWidget(self.btn_batch_scan)
-        layout.addLayout(controls)
-
-        source = QHBoxLayout()
-        self.combo_quality = QComboBox()
+        self.combo_quality = InspectionComboBox()
         self.combo_quality.addItem("快速预览", True)
         self.combo_quality.addItem("原图精查", False)
         self.combo_quality.setToolTip("快速预览缩小 RGB 后扫描。框选和红外扫描始终使用原图。")
-        source.addWidget(self.combo_quality, 1)
-        self.combo_source = QComboBox()
+        self.combo_source = InspectionComboBox()
         self.combo_source.addItem("优先红外", True)
         self.combo_source.addItem("仅 RGB", False)
         self.combo_source.setToolTip("检测到可用红外层时优先使用，否则自动扫描 RGB。")
-        source.addWidget(self.combo_source, 1)
-        layout.addLayout(source)
+        self.combo_focus = InspectionComboBox()
+        self.combo_focus.addItem("主体优先", True)
+        self.combo_focus.addItem("全画面", False)
+        self.combo_focus.setToolTip("主体优先侧重人脸和平坦背景，减少复杂纹理中的候选。全画面使用同等灵敏度。RGB 整图扫描会避开识别出的片框。")
+        self.btn_detect = QPushButton("扫描缺陷")
+        self.btn_batch_scan = QPushButton("批量扫描")
+        self.btn_batch_scan.setObjectName("secondaryBtn")
+        self.btn_batch_scan.setToolTip("选择照片并批量扫描")
+        for row, pair in enumerate(((self.combo_sensitivity, self.combo_quality),
+                                    (self.combo_source, self.combo_focus),
+                                    (self.btn_detect, self.btn_batch_scan))):
+            for column, control in zip((0, 2), pair):
+                control.setFixedHeight(34)
+                grid.addWidget(control, row, column, 1, 2)
 
-        self.combo_focus = QComboBox()
-        self.combo_focus.addItem("主体优先 · 人脸和平坦背景", True)
-        self.combo_focus.addItem("全画面 · 同等灵敏度", False)
-        self.combo_focus.setToolTip("主体优先会压低复杂纹理和齿孔边缘的候选，红外和框选补查独立工作。")
-        layout.addWidget(self.combo_focus)
-
-        inspection = QHBoxLayout()
         self.layer_group = QButtonGroup(self)
         self.layer_buttons = {}
         for mode, label, hint in (("rgb", "RGB", "显示当前照片"),
@@ -235,7 +242,6 @@ class DustPanel(QWidget):
             button.setProperty("layer", mode)
             self.layer_group.addButton(button)
             self.layer_buttons[mode] = button
-            inspection.addWidget(button)
         self.layer_buttons["rgb"].setChecked(True)
         self.set_infrared_available(False)
         self.layer_group.buttonToggled.connect(lambda _, checked: self.inspection_changed.emit() if checked else None)
@@ -244,8 +250,19 @@ class DustPanel(QWidget):
         self.btn_dust_view.setCheckable(True)
         self.btn_dust_view.setToolTip("以反相的局部对比突出细微灰点，只改变显示")
         self.btn_dust_view.toggled.connect(self.inspection_changed)
-        inspection.addWidget(self.btn_dust_view)
-        layout.addLayout(inspection)
+        for column, button in enumerate((*self.layer_buttons.values(), self.btn_dust_view)):
+            button.setFixedHeight(34)
+            grid.addWidget(button, 3, column)
+        return grid
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(6)
+        title = QLabel("缺陷检查")
+        title.setObjectName("titleLabel")
+        layout.addWidget(title)
+        layout.addLayout(self._scan_controls())
         self.dust_contrast = QSlider(Qt.Horizontal)
         self.dust_contrast.setRange(10, 90)
         self.dust_contrast.setValue(40)
@@ -276,7 +293,7 @@ class DustPanel(QWidget):
         layout.addWidget(preview_frame)
 
         filters = QHBoxLayout()
-        self.combo_filter = QComboBox()
+        self.combo_filter = InspectionComboBox()
         for label, value in (("全部候选", "all"), ("灰点", "spot"),
                              ("划痕 / 毛絮", "fiber"), ("片面破损", "damage"),
                              ("红外缺陷", "infrared"),
@@ -308,15 +325,16 @@ class DustPanel(QWidget):
         self.lbl_stats = QLabel("等待扫描")
         self.lbl_stats.setObjectName("subtitleLabel")
         summary.addWidget(self.lbl_stats, 1)
-        for label, value in (("勾选可见", True), ("清空勾选", False)):
-            button = QPushButton(label)
+        self.btn_check_visible = QPushButton("勾选可见")
+        self.btn_uncheck_visible = QPushButton("清空勾选")
+        for button, value in ((self.btn_check_visible, True), (self.btn_uncheck_visible, False)):
             button.setObjectName("textBtn")
             button.clicked.connect(lambda _, enabled=value: self._select_visible(enabled))
             summary.addWidget(button)
         layout.addLayout(summary)
 
         repair = QHBoxLayout()
-        self.combo_method = QComboBox()
+        self.combo_method = InspectionComboBox()
         self.combo_method.addItem("自动 · 保留胶片颗粒", "auto")
         self.combo_method.addItem("保颗粒修复", "grain")
         self.combo_method.addItem("Navier–Stokes", "ns")

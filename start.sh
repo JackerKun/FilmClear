@@ -23,4 +23,8 @@ if [[ "${1:-}" == "--test" ]]; then
     exec "$python" -m unittest discover -s tests "$@"
 fi
 
+if [[ "$(uname -s)" == Darwin ]]; then
+    exec "$python" tools/macos_launch.py "$@"
+fi
+
 exec "$python" main.py "$@"

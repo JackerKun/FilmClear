@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QThread, Qt, Signal
+from PySide6.QtCore import QSignalBlocker, QSize, QThread, Qt, Signal
 from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -10,16 +10,17 @@ from PySide6.QtWidgets import (
 )
 from core.scan_io import is_ir_sidecar
 
+from .tool_icons import tool_icon
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
 
 class Thumbnails(QThread):
     ready = Signal(int, QImage)
 
-    def __init__(self, paths, parent, *, first_row, generation):
+    def __init__(self, paths, parent, *, generation):
         super().__init__(parent)
         self.paths = paths
-        self.first_row = first_row
         self.generation = generation
 
     def run(self):
@@ -52,21 +53,30 @@ class FilePanel(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 10, 10, 10)
+        layout.setSpacing(6)
         title = QLabel("照片")
         title.setObjectName("titleLabel")
-        layout.addWidget(title)
-
-        self.btn_add_photos = QPushButton("添加照片…")
-        self.btn_add_photos.setToolTip("选择一张或多张照片，添加到当前列表")
+        header = QHBoxLayout()
+        header.setSpacing(4)
+        header.addWidget(title, 1)
+        self.btn_add_photos = QPushButton()
+        self.btn_open = QPushButton()
+        self.btn_clear = QPushButton()
+        for button, name, tip in (
+            (self.btn_add_photos, "添加照片", "添加照片… · 选择一张或多张照片"),
+            (self.btn_open, "打开文件夹", "打开文件夹…"),
+            (self.btn_clear, "清空列表", "清空列表 · 保留原片和修复记录"),
+        ):
+            button.setObjectName("photoAddBtn" if button is self.btn_add_photos else "photoActionBtn")
+            button.setFixedSize(30, 30)
+            button.setIconSize(QSize(16, 16))
+            button.setAccessibleName(name)
+            button.setToolTip(tip)
+            header.addWidget(button)
         self.btn_add_photos.clicked.connect(self.open_photos)
-        layout.addWidget(self.btn_add_photos)
-
-        self.btn_open = QPushButton("打开文件夹…")
-        self.btn_open.setObjectName("secondaryBtn")
         self.btn_open.clicked.connect(self.open_directory)
-        layout.addWidget(self.btn_open)
+        layout.addLayout(header)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索照片名称")
@@ -110,13 +120,18 @@ class FilePanel(QWidget):
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         layout.addWidget(self.file_list, 1)
 
+    def update_icons(self, color, primary):
+        self.btn_add_photos.setIcon(tool_icon("add-photo", primary))
+        self.btn_open.setIcon(tool_icon("open-folder", color))
+        self.btn_clear.setIcon(tool_icon("clear-list", color))
+
     def load_directory(self, directory):
         paths = sorted(Path(directory).iterdir(), key=lambda path: path.name.casefold())
         self.load_files(paths)
 
-    def load_files(self, paths, *, append=False):
+    def load_files(self, paths, *, append=False, keep_missing=False):
         photos = [path for path in dict.fromkeys(Path(path).resolve() for path in paths)
-                  if path.suffix.lower() in IMAGE_EXTENSIONS and path.is_file()]
+                  if path.suffix.lower() in IMAGE_EXTENSIONS and (keep_missing or path.is_file())]
         stems = {}
         for path in photos:
             stems.setdefault(path.parent, set()).add(path.stem.casefold())
@@ -132,7 +147,6 @@ class FilePanel(QWidget):
                 worker.requestInterruption()
             self._files.clear()
             self.file_list.clear()
-        first_row = len(self._files)
         self._files.extend(files)
         for path in files:
             row = QListWidgetItem(Path(path).name)
@@ -144,8 +158,7 @@ class FilePanel(QWidget):
         if not append:
             self.directory_loaded.emit(files)
         if files:
-            worker = Thumbnails(files, self, first_row=first_row,
-                                generation=self._thumbnail_generation)
+            worker = Thumbnails(files, self, generation=self._thumbnail_generation)
             self._workers.add(worker)
             worker.ready.connect(self._thumbnail_ready)
             worker.finished.connect(self._thumbnail_finished)
@@ -156,7 +169,9 @@ class FilePanel(QWidget):
     def _thumbnail_ready(self, index, image):
         worker = self.sender()
         if worker in self._workers and worker.generation == self._thumbnail_generation:
-            self.file_list.item(worker.first_row + index).setIcon(QIcon(QPixmap.fromImage(image)))
+            path = worker.paths[index]
+            if path in self._files:
+                self.file_list.item(self._files.index(path)).setIcon(QIcon(QPixmap.fromImage(image)))
 
     def _thumbnail_finished(self):
         self._workers.discard(self.sender())
@@ -167,16 +182,28 @@ class FilePanel(QWidget):
             worker.wait()
 
     def select_file(self, filepath, *, quiet=False):
-        if filepath is None:
-            return
-        filepath = str(Path(filepath).resolve())
-        if filepath in self._files:
+        filepath = str(Path(filepath).resolve()) if filepath is not None else None
+        if filepath is None or filepath in self._files:
             self.file_list.blockSignals(quiet)
-            self.file_list.setCurrentRow(self._files.index(filepath))
+            self.file_list.setCurrentRow(-1 if filepath is None else self._files.index(filepath))
             self.file_list.blockSignals(False)
 
     def photo_paths(self):
         return list(self._files)
+
+    def photo_at(self, row):
+        return self._files[row] if 0 <= row < len(self._files) else None
+
+    def remove_file(self, path):
+        row = self._files.index(path)
+        with QSignalBlocker(self.file_list):
+            self._files.pop(row)
+            self.file_list.takeItem(row)
+        self._update_summary()
+        for index in (*range(row, len(self._files)), *range(row - 1, -1, -1)):
+            if not self.file_list.item(index).isHidden():
+                return self._files[index]
+        return None
 
     def set_photo_status(self, path, status, count, *, scanned=False, repaired=False):
         if path in self._files:
@@ -232,5 +259,6 @@ class FilePanel(QWidget):
                 return
 
     def _on_file_selected(self, row):
-        if 0 <= row < len(self._files):
-            self.file_selected.emit(self._files[row])
+        path = self.photo_at(row)
+        if path is not None:
+            self.file_selected.emit(path)
