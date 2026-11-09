@@ -10,6 +10,7 @@ class ThemeManager(QObject):
     theme_changed = Signal(str)
     
     _instance = None
+    _initialized = False
     
     DARK = "dark"
     LIGHT = "light"
@@ -19,6 +20,12 @@ class ThemeManager(QObject):
             cls._instance = super().__new__(cls)
             cls._instance._current_theme = cls.DARK
         return cls._instance
+
+    def __init__(self):
+        if ThemeManager._initialized:
+            return
+        super().__init__()
+        ThemeManager._initialized = True
     
     @property
     def current_theme(self) -> str:

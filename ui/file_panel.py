@@ -4,7 +4,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QSize, QThread, Qt, Signal
 from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
-from PySide6.QtWidgets import QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QButtonGroup, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QPushButton, QVBoxLayout, QWidget,
+)
 from core.scan_io import is_ir_sidecar
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
@@ -13,9 +16,11 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 class Thumbnails(QThread):
     ready = Signal(int, QImage)
 
-    def __init__(self, paths, parent):
+    def __init__(self, paths, parent, *, first_row, generation):
         super().__init__(parent)
         self.paths = paths
+        self.first_row = first_row
+        self.generation = generation
 
     def run(self):
         for index, path in enumerate(self.paths):
@@ -34,6 +39,7 @@ class Thumbnails(QThread):
 class FilePanel(QWidget):
     file_selected = Signal(str)
     directory_loaded = Signal(list)
+    open_photos = Signal()
     open_directory = Signal()
 
     def __init__(self, parent=None):
@@ -41,7 +47,7 @@ class FilePanel(QWidget):
         self.setObjectName("sidebar")
         self._files = []
         self._workers = set()
-        self._thumbnail_job = None
+        self._thumbnail_generation = 0
         self._setup_ui()
 
     def _setup_ui(self):
@@ -52,10 +58,44 @@ class FilePanel(QWidget):
         title.setObjectName("titleLabel")
         layout.addWidget(title)
 
+        self.btn_add_photos = QPushButton("添加照片…")
+        self.btn_add_photos.setToolTip("选择一张或多张照片，添加到当前列表")
+        self.btn_add_photos.clicked.connect(self.open_photos)
+        layout.addWidget(self.btn_add_photos)
+
         self.btn_open = QPushButton("打开文件夹…")
         self.btn_open.setObjectName("secondaryBtn")
         self.btn_open.clicked.connect(self.open_directory)
         layout.addWidget(self.btn_open)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索照片名称")
+        self.search.setAccessibleName("搜索照片名称")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._refresh_filter)
+        layout.addWidget(self.search)
+
+        filters = QHBoxLayout()
+        filters.setSpacing(2)
+        self.filters = QButtonGroup(self)
+        self.filter_buttons = {}
+        for key, text, hint in (
+            ("all", "全部", "显示全部照片"),
+            ("unscanned", "待扫", "只显示未扫描的照片"),
+            ("candidates", "候选", "只显示还有缺陷候选的照片"),
+            ("repaired", "修复", "只显示已有修复的照片"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName("photoFilterBtn")
+            button.setToolTip(hint)
+            button.setCheckable(True)
+            button.setProperty("filter", key)
+            self.filters.addButton(button)
+            self.filter_buttons[key] = button
+            filters.addWidget(button, 1)
+        self.filter_buttons["all"].setChecked(True)
+        self.filters.buttonToggled.connect(lambda _, checked: self._refresh_filter() if checked else None)
+        layout.addLayout(filters)
 
         self.lbl_info = QLabel("将照片或文件夹拖入窗口")
         self.lbl_info.setWordWrap(True)
@@ -74,44 +114,52 @@ class FilePanel(QWidget):
         paths = sorted(Path(directory).iterdir(), key=lambda path: path.name.casefold())
         self.load_files(paths)
 
-    def load_files(self, paths):
+    def load_files(self, paths, *, append=False):
         photos = [path for path in dict.fromkeys(Path(path).resolve() for path in paths)
                   if path.suffix.lower() in IMAGE_EXTENSIONS and path.is_file()]
         stems = {}
         for path in photos:
             stems.setdefault(path.parent, set()).add(path.stem.casefold())
-        files = [str(path) for path in photos if not is_ir_sidecar(path, stems[path.parent])]
-        if self._thumbnail_job is not None:
-            self._thumbnail_job.requestInterruption()
-        self._thumbnail_job = None
-        self._files = files
-        self.file_list.clear()
+        existing = set(self._files) if append else set()
+        for file in existing:
+            path = Path(file)
+            stems.setdefault(path.parent, set()).add(path.stem.casefold())
+        files = [str(path) for path in photos
+                 if str(path) not in existing and not is_ir_sidecar(path, stems[path.parent])]
+        if not append:
+            self._thumbnail_generation += 1
+            for worker in self._workers:
+                worker.requestInterruption()
+            self._files.clear()
+            self.file_list.clear()
+        first_row = len(self._files)
+        self._files.extend(files)
         for path in files:
             row = QListWidgetItem(Path(path).name)
             row.setSizeHint(QSize(0, 58))
             row.setToolTip(path)
+            row.setData(Qt.UserRole, (False, False, False))
             self.file_list.addItem(row)
-        self.lbl_info.setText(f"{len(files)} 张照片" if files else "未找到支持的照片")
-        self.directory_loaded.emit(files)
-        if not files:
-            return
-        worker = Thumbnails(files, self)
-        self._thumbnail_job = worker
-        self._workers.add(worker)
-        worker.ready.connect(self._thumbnail_ready)
-        worker.finished.connect(self._thumbnail_finished)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+        self._refresh_filter()
+        if not append:
+            self.directory_loaded.emit(files)
+        if files:
+            worker = Thumbnails(files, self, first_row=first_row,
+                                generation=self._thumbnail_generation)
+            self._workers.add(worker)
+            worker.ready.connect(self._thumbnail_ready)
+            worker.finished.connect(self._thumbnail_finished)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+        return files
 
     def _thumbnail_ready(self, index, image):
-        if self.sender() is self._thumbnail_job:
-            self.file_list.item(index).setIcon(QIcon(QPixmap.fromImage(image)))
+        worker = self.sender()
+        if worker in self._workers and worker.generation == self._thumbnail_generation:
+            self.file_list.item(worker.first_row + index).setIcon(QIcon(QPixmap.fromImage(image)))
 
     def _thumbnail_finished(self):
-        worker = self.sender()
-        self._workers.discard(worker)
-        if self._thumbnail_job is worker:
-            self._thumbnail_job = None
+        self._workers.discard(self.sender())
 
     def stop_thumbnails(self):
         for worker in tuple(self._workers):
@@ -130,19 +178,58 @@ class FilePanel(QWidget):
     def photo_paths(self):
         return list(self._files)
 
-    def set_photo_status(self, path, status, count):
+    def set_photo_status(self, path, status, count, *, scanned=False, repaired=False):
         if path in self._files:
-            row = self.file_list.item(self._files.index(path))
+            index = self._files.index(path)
+            row = self.file_list.item(index)
             name = Path(path).name
             row.setText(name if count is None else f"{name}  ·  {count}")
             row.setToolTip(f"{path}\n{status}")
+            row.setData(Qt.UserRole, (scanned, bool(count), repaired))
+            self._filter_row(index, row)
+            self._update_summary()
+
+    def reveal_file(self, path):
+        if path in self._files and self.file_list.item(self._files.index(path)).isHidden():
+            self.search.clear()
+            self.filter_buttons["all"].setChecked(True)
+
+    def _filter_row(self, index, row):
+        mode = self.filters.checkedButton().property("filter")
+        scanned, candidates, repaired = row.data(Qt.UserRole)
+        show = {"all": True, "unscanned": not scanned, "candidates": candidates, "repaired": repaired}[mode]
+        name = Path(self._files[index]).name.casefold()
+        row.setHidden(not show or self.search.text().strip().casefold() not in name)
+
+    def _refresh_filter(self, *_):
+        for index in range(self.file_list.count()):
+            self._filter_row(index, self.file_list.item(index))
+        self._update_summary()
+
+    def _update_summary(self):
+        rows = [self.file_list.item(index) for index in range(self.file_list.count())]
+        if not rows:
+            self.lbl_info.setText("将照片或文件夹拖入窗口")
+            return
+        visible = sum(not row.isHidden() for row in rows)
+        scanned = sum(row.data(Qt.UserRole)[0] for row in rows)
+        self.lbl_info.setText(f"显示 {visible}/{len(rows)} 张 · 已扫 {scanned} 张")
 
     def select_next(self):
-        self.file_list.setCurrentRow(min(len(self._files) - 1, self.file_list.currentRow() + 1))
+        self._select_visible(1)
 
     def select_prev(self):
-        if self._files:
-            self.file_list.setCurrentRow(max(0, self.file_list.currentRow() - 1))
+        self._select_visible(-1)
+
+    def _select_visible(self, step):
+        current = self.file_list.currentRow()
+        if current < 0 and step < 0:
+            current = len(self._files)
+        stop = len(self._files) if step > 0 else -1
+        for index in range(current + step, stop, step):
+            if not self.file_list.item(index).isHidden():
+                self.file_list.setCurrentRow(index)
+                return
 
     def _on_file_selected(self, row):
         if 0 <= row < len(self._files):

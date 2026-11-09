@@ -100,7 +100,7 @@ class ImageViewer(QGraphicsView):
         self._show_all = visible
         self.viewport().update()
 
-    def highlight_dust(self, dust_id, *, locate=False):
+    def highlight_dust(self, dust_id, *, locate=False, min_zoom=0.65):
         dust = self._items.get(dust_id)
         if dust is None:
             self.reset_highlight()
@@ -109,8 +109,8 @@ class ImageViewer(QGraphicsView):
             self._focus_id = dust_id
             self._focus_path = defect_path(dust)
         if locate:
-            if self.transform().m11() < 0.65:
-                self._zoom_to(0.65)
+            if self.transform().m11() < min_zoom:
+                self._zoom_to(min_zoom)
             self.centerOn(*dust.center)
         self.viewport().update()
 
@@ -138,7 +138,7 @@ class ImageViewer(QGraphicsView):
             painter.resetTransform()
             painter.setPen(QColor("#9eacbc"))
             painter.drawText(self.viewport().rect(), Qt.AlignCenter,
-                             "导入胶片扫描照片\n在左侧打开一个文件夹")
+                             "导入胶片扫描照片\n在左侧添加照片或打开文件夹")
             painter.restore()
             return
 
@@ -218,6 +218,19 @@ class ImageViewer(QGraphicsView):
         painter.setBrush(QColor("#dce8f3"))
         painter.drawRoundedRect(QRectF(split - 4, view.height() / 2 - 15, 8, 30), 4, 4)
         painter.restore()
+
+    def view_position(self):
+        point = self.mapToScene(self.viewport().rect().center())
+        return self._fit, self.transform().m11(), point.x(), point.y()
+
+    def restore_view(self, position):
+        fit, scale, x, y = position
+        if fit:
+            self.fit_to_window()
+            return
+        self._zoom_to(scale)
+        self._fit = False
+        self.centerOn(x, y)
 
     def get_zoom_percent(self):
         return round(self.transform().m11() * 100)

@@ -148,6 +148,7 @@ def _map_from_preview(items, source_shape, preview_shape):
         return np.clip(np.rint((np.asarray(points) + 0.5) * factors - 0.5), 0, limits).astype(np.int32)
 
     for item in items:
+        item.preview = True
         item.contour = mapped(item.contour)
         item.holes = tuple(mapped(hole) for hole in item.holes)
         item.x, item.y, item.width, item.height = cv2.boundingRect(item.contour)
@@ -199,6 +200,8 @@ def detect_scan(image, params, *, infrared=None, quick=True, region=None, subjec
             infrared, region, lambda done, total: report("红外", done, total), image=image
         )
         if infrared_items is not None and region is None:
+            for index, item in enumerate(infrared_items, 1):
+                item.id = index
             return ScanResult(infrared_items, "红外")
     detector = NativeDustDetector(**params)
     source = "RGB 原图"
@@ -295,3 +298,26 @@ def detect_brush(image, params, points, radius, *, infrared=None, progress=None)
                 kept.append(item)
     result.items = kept
     return result
+
+
+def refine_candidate(image, item, params, *, progress=None):
+    """Retrace a proxy contour on original pixels using its neighborhood."""
+    height, width = image.shape[:2]
+    margin = max(20, min(96, max(item.width, item.height) // 2))
+    region = (max(0, item.x - margin), max(0, item.y - margin),
+              min(width, item.x + item.width + margin), min(height, item.y + item.height + margin))
+    candidates = detect_scan(image, params, region=region, progress=progress).items
+    related = ("fiber", "scratch")
+    scale = max(4, min(item.width, item.height))
+    matched = []
+    for candidate in candidates:
+        if (candidate.dust_type != item.dust_type
+                and not (candidate.dust_type in related and item.dust_type in related)):
+            continue
+        distance = np.hypot(candidate.center_x - item.center_x, candidate.center_y - item.center_y)
+        overlap = (min(item.x + item.width, candidate.x + candidate.width) > max(item.x, candidate.x)
+                   and min(item.y + item.height, candidate.y + candidate.height) > max(item.y, candidate.y))
+        if overlap and distance <= max(scale, 0.4 * max(item.width, item.height)):
+            matched.append((distance / scale + abs(np.log(candidate.area / max(1, item.area))) * 0.18,
+                            candidate))
+    return min(matched, key=lambda pair: pair[0])[1] if matched else None

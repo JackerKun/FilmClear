@@ -1,12 +1,18 @@
 """Candidate review, local detail preview, and repair controls."""
 
+from dataclasses import replace
+
 import cv2
-from PySide6.QtCore import QRectF, QTimer, Qt, Signal
+import numpy as np
+from PySide6.QtCore import QRectF, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
+
+from core.dust_remover import DustRemover
+from core.scan_io import display_pixels
 
 from .image_viewer import photo_pixmap
 
@@ -14,15 +20,22 @@ from .image_viewer import photo_pixmap
 class CandidatePreview(QWidget):
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(132)
+        self.setMinimumHeight(84)
+        self.setMaximumHeight(132)
         self.setAccessibleName("缺陷局部放大预览")
         self._pixmap = None
+        self._comparison = ()
         self._target = None
         self._rect = QRectF()
         self._bounds = QRectF()
 
-    def show_candidate(self, image=None, item=None):
+    def sizeHint(self):
+        return QSize(230, 106)
+
+    def show_candidate(self, image=None, item=None, *, original=None, repair_params=None):
         self._pixmap = None
+        self._comparison = ()
+        self._target = None
         if image is not None and item is not None:
             h, w = image.shape[:2]
             x, y, width, height = item.bbox
@@ -38,11 +51,40 @@ class CandidatePreview(QWidget):
             self._target = item.center
             self._bounds = QRectF(*item.bbox)
             self._rect = QRectF(x1, y1, x2 - x1, y2 - y1)
+            if original is not None and repair_params is not None:
+                current = image[y1:y2, x1:x2]
+                before = original[y1:y2, x1:x2]
+                factor = min(1, 640 / max(crop_w, crop_h))
+
+                def mapped(contour):
+                    return np.rint((contour - (x1, y1)) * factor).astype(np.int32)
+
+                if factor < 1:
+                    size = (max(1, round(crop_w * factor)), max(1, round(crop_h * factor)))
+                    current = cv2.resize(current, size, interpolation=cv2.INTER_AREA)
+                    before = cv2.resize(before, size, interpolation=cv2.INTER_AREA)
+                local = replace(
+                    item, x=round((x - x1) * factor), y=round((y - y1) * factor),
+                    width=max(1, round(width * factor)), height=max(1, round(height * factor)),
+                    contour=mapped(item.contour) if item.contour is not None else None,
+                    holes=tuple(mapped(hole) for hole in item.holes),
+                )
+                remover = DustRemover(**repair_params)
+                mask = remover.create_mask(current.shape, [local], selected_only=False,
+                                           padding=max(1, round(2 * factor)))
+                marked = display_pixels(current).copy()
+                area = mask != 0
+                marked[area] = (marked[area] * 0.32 + np.array([176, 242, 99]) * 0.68).astype(np.uint8)
+                fixed = remover.apply_mask(current, mask)
+                self._comparison = tuple(photo_pixmap(pixels) for pixels in (before, marked, fixed))
         self.update()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#171e26"))
+        if self._comparison:
+            self._paint_comparison(painter)
+            return
         if self._pixmap is None:
             painter.setPen(QColor("#a4b1bf"))
             painter.drawText(self.rect(), Qt.AlignCenter, "悬停候选，查看局部细节")
@@ -70,6 +112,21 @@ class CandidatePreview(QWidget):
         for color, width in (("#14232b", 5), ("#70f4d9", 2.5)):
             painter.setPen(QPen(QColor(color), width))
             painter.drawEllipse(ring)
+
+
+    def _paint_comparison(self, painter):
+        gap = 5
+        width = (self.width() - gap * 4) / 3
+        height = self.height() - 27
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setPen(QColor("#dbe6ee"))
+        for index, (label, pixmap) in enumerate(zip(("原片", "蒙版", "试修"), self._comparison)):
+            x = gap + index * (width + gap)
+            scale = min(width / pixmap.width(), height / pixmap.height())
+            w, h = pixmap.width() * scale, pixmap.height() * scale
+            painter.drawText(QRectF(x, 2, width, 19), Qt.AlignCenter, label)
+            painter.drawPixmap(QRectF(x + (width - w) / 2, 23 + (height - h) / 2, w, h),
+                               pixmap, QRectF(pixmap.rect()))
 
 
 class CandidateList(QListWidget):
@@ -113,6 +170,8 @@ class DustPanel(QWidget):
     select_all_clicked = Signal(bool)
     remove_clicked = Signal()
     export_clicked = Signal()
+    inspection_changed = Signal()
+    preview_mode_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -124,7 +183,7 @@ class DustPanel(QWidget):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 12)
-        layout.setSpacing(9)
+        layout.setSpacing(6)
         title = QLabel("缺陷检查")
         title.setObjectName("titleLabel")
         layout.addWidget(title)
@@ -138,6 +197,10 @@ class DustPanel(QWidget):
         controls.addWidget(self.combo_sensitivity, 1)
         self.btn_detect = QPushButton("扫描缺陷")
         controls.addWidget(self.btn_detect)
+        self.btn_batch_scan = QPushButton("批量")
+        self.btn_batch_scan.setObjectName("secondaryBtn")
+        self.btn_batch_scan.setToolTip("选择照片并批量扫描")
+        controls.addWidget(self.btn_batch_scan)
         layout.addLayout(controls)
 
         source = QHBoxLayout()
@@ -159,6 +222,39 @@ class DustPanel(QWidget):
         self.combo_focus.setToolTip("主体优先会压低复杂纹理和齿孔边缘的候选，红外和框选补查独立工作。")
         layout.addWidget(self.combo_focus)
 
+        inspection = QHBoxLayout()
+        self.layer_group = QButtonGroup(self)
+        self.layer_buttons = {}
+        for mode, label, hint in (("rgb", "RGB", "显示当前照片"),
+                                  ("ir", "红外", "查看归一化的扫描红外层"),
+                                  ("overlay", "叠加", "将红外着色并叠到照片上，检查对齐")):
+            button = QPushButton(label)
+            button.setObjectName("toolBtn")
+            button.setToolTip(hint)
+            button.setCheckable(True)
+            button.setProperty("layer", mode)
+            self.layer_group.addButton(button)
+            self.layer_buttons[mode] = button
+            inspection.addWidget(button)
+        self.layer_buttons["rgb"].setChecked(True)
+        self.set_infrared_available(False)
+        self.layer_group.buttonToggled.connect(lambda _, checked: self.inspection_changed.emit() if checked else None)
+        self.btn_dust_view = QPushButton("显尘")
+        self.btn_dust_view.setObjectName("toolBtn")
+        self.btn_dust_view.setCheckable(True)
+        self.btn_dust_view.setToolTip("以反相的局部对比突出细微灰点，只改变显示")
+        self.btn_dust_view.toggled.connect(self.inspection_changed)
+        inspection.addWidget(self.btn_dust_view)
+        layout.addLayout(inspection)
+        self.dust_contrast = QSlider(Qt.Horizontal)
+        self.dust_contrast.setRange(10, 90)
+        self.dust_contrast.setValue(40)
+        self.dust_contrast.setToolTip("显尘对比度")
+        self.dust_contrast.setAccessibleName("显尘对比度")
+        self.dust_contrast.valueChanged.connect(self.inspection_changed)
+        self.dust_contrast.hide()
+        layout.addWidget(self.dust_contrast)
+
         preview_frame = QFrame()
         preview_frame.setObjectName("card")
         preview_layout = QVBoxLayout(preview_frame)
@@ -166,7 +262,15 @@ class DustPanel(QWidget):
         self.preview_title = QLabel("局部预览")
         self.preview_title.setObjectName("sectionLabel")
         self.preview_title.setMinimumWidth(0)
-        preview_layout.addWidget(self.preview_title)
+        preview_header = QHBoxLayout()
+        preview_header.addWidget(self.preview_title, 1)
+        self.btn_trial = QPushButton("三联预览")
+        self.btn_trial.setObjectName("toolBtn")
+        self.btn_trial.setCheckable(True)
+        self.btn_trial.setToolTip("并排查看同一块原片、修复蒙版和试修结果")
+        self.btn_trial.toggled.connect(self.preview_mode_changed)
+        preview_header.addWidget(self.btn_trial)
+        preview_layout.addLayout(preview_header)
         self.preview = CandidatePreview()
         preview_layout.addWidget(self.preview)
         layout.addWidget(preview_frame)
@@ -185,6 +289,11 @@ class DustPanel(QWidget):
         self.btn_dismiss.setToolTip("忽略当前行，可用撤销恢复")
         self.btn_dismiss.clicked.connect(self._dismiss_current)
         self.btn_dismiss.setEnabled(False)
+        self.btn_refine = QPushButton("原图核对")
+        self.btn_refine.setObjectName("secondaryBtn")
+        self.btn_refine.setToolTip("在原始像素上重新描出快速预览的候选轮廓 · R")
+        self.btn_refine.setEnabled(False)
+        filters.addWidget(self.btn_refine)
         filters.addWidget(self.btn_dismiss)
         layout.addLayout(filters)
 
@@ -208,15 +317,19 @@ class DustPanel(QWidget):
 
         repair = QHBoxLayout()
         self.combo_method = QComboBox()
-        self.combo_method.addItem("Navier–Stokes（默认）", "ns")
+        self.combo_method.addItem("自动 · 保留胶片颗粒", "auto")
+        self.combo_method.addItem("保颗粒修复", "grain")
+        self.combo_method.addItem("Navier–Stokes", "ns")
         self.combo_method.addItem("Telea", "telea")
         self.combo_method.setToolTip("修复算法")
+        self.combo_method.currentIndexChanged.connect(self.preview_mode_changed)
         repair.addWidget(self.combo_method, 1)
         self.spin_inpaint_radius = QSpinBox()
         self.spin_inpaint_radius.setRange(1, 20)
         self.spin_inpaint_radius.setValue(3)
         self.spin_inpaint_radius.setPrefix("半径  ")
         self.spin_inpaint_radius.setSuffix(" px")
+        self.spin_inpaint_radius.valueChanged.connect(self.preview_mode_changed)
         repair.addWidget(self.spin_inpaint_radius)
         layout.addLayout(repair)
 
@@ -236,6 +349,26 @@ class DustPanel(QWidget):
         actions.addWidget(self.btn_export)
         layout.addLayout(actions)
 
+    def set_infrared_available(self, available):
+        if not available:
+            self.layer_buttons["rgb"].setChecked(True)
+        for layer in ("ir", "overlay"):
+            self.layer_buttons[layer].setEnabled(available)
+
+    def inspection_layer(self):
+        return self.layer_group.checkedButton().property("layer")
+
+    def step_candidate(self, direction):
+        total = self.dust_list.count()
+        if not total:
+            return None
+        index = self.dust_list.currentRow()
+        index = (index + direction) % total if index >= 0 else (0 if direction > 0 else total - 1)
+        self.dust_list.setCurrentRow(index)
+        row = self.dust_list.currentItem()
+        self.dust_list.scrollToItem(row)
+        return row.data(Qt.UserRole)
+
     def get_detection_params(self):
         threshold, confidence = self.combo_sensitivity.currentData()
         return {"threshold": threshold, "min_area": 3, "min_confidence": confidence}
@@ -254,10 +387,13 @@ class DustPanel(QWidget):
         self._items = {item.id: item for item in items}
         self._render_list()
 
-    def show_candidate(self, image=None, item=None):
-        self.preview.show_candidate(image, item)
+    def show_candidate(self, image=None, item=None, *, original=None):
+        trial = self.btn_trial.isChecked()
+        self.preview.show_candidate(image, item, original=original if trial else None,
+                                    repair_params=self.get_inpaint_params() if trial else None)
+        self.btn_refine.setEnabled(bool(item and item.preview))
         self.preview_title.setText(
-            f"局部预览   ·   #{item.id:03d}  {item.type_name}   ·   {item.width} × {item.height} px"
+            f"#{item.id:03d}  {item.type_name} · {item.width} × {item.height}"
             if item is not None else "局部预览"
         )
 
@@ -280,7 +416,8 @@ class DustPanel(QWidget):
             row = QListWidgetItem(f"#{item.id:03d}    {item.type_name}     {item.width} × {item.height} px")
             row.setData(Qt.UserRole, item.id)
             row.setCheckState(Qt.Checked if item.selected else Qt.Unchecked)
-            row.setToolTip(f"候选分数 {item.confidence:.2f}  ·  原图位置 {item.center_x}, {item.center_y}")
+            source = "红外" if item.dust_type == "infrared" else ("RGB 快速预览" if item.preview else "RGB 原图")
+            row.setToolTip(f"{source} · 候选分数 {item.confidence:.2f} · 原图位置 {item.center_x}, {item.center_y}")
             self.dust_list.addItem(row)
             if item.id == current_id:
                 self.dust_list.setCurrentItem(row)

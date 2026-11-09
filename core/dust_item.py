@@ -21,6 +21,7 @@ class DustItem:
     contour: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
     aspect_ratio: float = 1.0
     holes: Tuple[np.ndarray, ...] = field(default_factory=tuple, repr=False, compare=False)
+    preview: bool = False
 
     @property
     def bbox(self) -> Tuple[int, int, int, int]:

@@ -226,3 +226,5 @@ __marimo__/
 /demo/*
 !/demo/IR-SOURCE.md
 /models/u2net*.onnx
+
+/filmclear_workspace.sqlite3*

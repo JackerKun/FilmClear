@@ -23,6 +23,8 @@ set "PYINSTALLER_CONFIG_DIR=%CD%\%WORK%\cache"
     --collect-data cv2.data ^
     --icon "%CD%\assets\filmclear.ico" ^
     --add-data "%CD%\assets\filmclear.png:assets" ^
+    --add-data "%CD%\assets\review-report.css:assets" ^
+    --add-data "%CD%\assets\review-report.js:assets" ^
     --add-data "%CD%\models\face_detection_yunet_2022mar.onnx:models" ^
     --add-data "%CD%\models\face_detection_yunet_2023mar.onnx:models" ^
     --add-data "%CD%\models\YuNet-LICENSE.txt:models" ^

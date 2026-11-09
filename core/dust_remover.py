@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from typing import List
 from .dust_item import DustItem
+from .grain_repair import restore_grain
 
 
 class DustRemover:
@@ -24,7 +25,7 @@ class DustRemover:
     
     def _get_cv_method(self) -> int:
         """获取 OpenCV inpaint 方法常量"""
-        if self.method == self.INPAINT_NS:
+        if self.method in (self.INPAINT_NS, "auto", "grain"):
             return cv2.INPAINT_NS
         return cv2.INPAINT_TELEA
     
@@ -130,6 +131,8 @@ class DustRemover:
                     ])
                 else:
                     repaired = cv2.inpaint(pixels, patch_mask, self.inpaint_radius, method)
+                if self.method in ("auto", "grain"):
+                    restore_grain(pixels, repaired, patch_mask, automatic=self.method == "auto")
                 center = np.s_[y1 - top:y2 - top, x1 - left:x2 - left]
                 target = np.s_[y1:y2, x1:x2]
                 cv2.copyTo(repaired[center], mask[target], result[target])

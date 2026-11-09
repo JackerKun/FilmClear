@@ -9,7 +9,8 @@ from tempfile import NamedTemporaryFile
 import cv2
 
 from .dust_remover import DustRemover
-from .scan_io import display_pixels, read_scan, signature
+from .export_metadata import read_metadata, write_repaired
+from .scan_io import read_scan, signature
 
 SOURCE_FORMAT = "source"
 
@@ -20,6 +21,7 @@ class ExportEntry:
     patches: tuple
     selected: tuple
     revision: int = 0
+    candidates: tuple = ()
 
 
 def replay_patches(original, patches):
@@ -51,42 +53,32 @@ def _write_entry(entry, directory, extension, mode, repair_params):
                 image = replay_patches(scan.image, entry.patches)
                 if mode == "repair" and entry.selected:
                     image = DustRemover(**repair_params).remove(image, entry.selected, selected_only=False)
-                codec = suffix.lower()
-                if codec in (".jpg", ".jpeg"):
-                    params = [cv2.IMWRITE_JPEG_QUALITY, 95]
-                elif codec == ".webp":
-                    params = [cv2.IMWRITE_WEBP_QUALITY, 101]
-                else:
-                    params = []
-                if codec in (".jpg", ".jpeg", ".webp", ".bmp"):
-                    image = display_pixels(image)
-                ok, buffer = cv2.imencode(
-                    codec, image, params,
-                )
-                if not ok:
-                    raise ValueError("图片编码失败")
-                output.write(buffer.tobytes())
+                write_repaired(output, image, suffix.lower(), read_metadata(source))
             output.close()
-            # Publish a complete file without overwriting an existing export,
-            # including another export made while this job was running.
-            index = 1
-            while True:
-                extra = "" if index == 1 else f"_{index}"
-                target = directory / f"{base}{extra}{suffix}"
-                try:
-                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                except FileExistsError:
-                    index += 1
-                    continue
-                os.close(fd)
-                try:
-                    temporary.replace(target)
-                except OSError:
-                    target.unlink(missing_ok=True)
-                    raise
-                return target
+            return publish_file(temporary, directory, base, suffix)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def publish_file(temporary, directory, base, suffix):
+    # Publish a complete file without overwriting an existing export,
+    # including another export made while this job was running.
+    index = 1
+    while True:
+        extra = "" if index == 1 else f"_{index}"
+        target = directory / f"{base}{extra}{suffix}"
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            index += 1
+            continue
+        os.close(fd)
+        try:
+            temporary.replace(target)
+        except OSError:
+            target.unlink(missing_ok=True)
+            raise
+        return target
 
 
 def export_batch(entries, directory, extension, mode, repair_params, progress, canceled):

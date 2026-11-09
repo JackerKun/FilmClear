@@ -4,3 +4,4 @@ PySide6-Essentials>=6.5.0
 opencv-python-headless>=4.6.0
 numpy>=1.23.0
 tifffile>=2022.10.10
+Pillow>=9.4.0

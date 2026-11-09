@@ -4,10 +4,11 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
 )
 from core.batch_export import SOURCE_FORMAT
+from core.export_metadata import describe_export
 
 
 class ExportDialog(QDialog):
@@ -63,6 +64,15 @@ class ExportDialog(QDialog):
         self.mode.currentIndexChanged.connect(
             lambda _: self.format.setEnabled(self.mode.currentData() != "original"))
         settings.addRow("文件格式", self.format)
+        self.output_info = QLabel()
+        self.output_info.setWordWrap(True)
+        self.output_info.setObjectName("subtitleLabel")
+        settings.addRow("输出信息", self.output_info)
+        self.include_review = QCheckBox("同时生成前后对照页（HTML）")
+        self.include_review.setToolTip("包含原片、实际导出结果和一处修复局部，可离线浏览")
+        settings.addRow(self.include_review)
+        self.mode.currentIndexChanged.connect(self._refresh_button)
+        self.format.currentIndexChanged.connect(self._refresh_button)
         folder = QHBoxLayout()
         self.directory = QLineEdit(str(directory))
         self.directory.setCursorPosition(0)
@@ -102,10 +112,18 @@ class ExportDialog(QDialog):
                 if self.photos.item(i).checkState() == Qt.Checked]
 
     def _refresh_button(self, *_):
-        count = len(self.selected_paths())
+        paths = self.selected_paths()
+        count = len(paths)
+        self.include_review.setEnabled(self.mode.currentData() != "original")
+        description = (describe_export(paths[0], self.format.currentData(), self.mode.currentData())
+                       if paths else "选择要导出的照片")
+        if count > 1:
+            description = f"首张 · {description}（其余按各原图）"
+        self.output_info.setText(description)
         self.photo_count.setText(f"已选 {count} / {self.photos.count()} 张")
         self.export_button.setEnabled(bool(self.directory.text().strip() and count))
 
     def selection(self):
         return (self.selected_paths(), Path(self.directory.text().strip()).expanduser(),
-                self.format.currentData(), self.mode.currentData())
+                self.format.currentData(), self.mode.currentData(),
+                self.include_review.isEnabled() and self.include_review.isChecked())

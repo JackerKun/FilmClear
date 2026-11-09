@@ -40,6 +40,8 @@ fi
     --distpath "$dist" --workpath "$work/work" --specpath "$work" \
     --collect-data cv2.data \
     --add-data "$PWD/assets/filmclear.png:assets" \
+    --add-data "$PWD/assets/review-report.css:assets" \
+    --add-data "$PWD/assets/review-report.js:assets" \
     --add-data "$PWD/models/face_detection_yunet_2022mar.onnx:models" \
     --add-data "$PWD/models/face_detection_yunet_2023mar.onnx:models" \
     --add-data "$PWD/models/YuNet-LICENSE.txt:models" \

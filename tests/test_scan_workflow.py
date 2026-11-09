@@ -197,6 +197,7 @@ class ScanWorkflowTest(unittest.TestCase):
         self.assertEqual(scan.infrared.dtype, np.uint16)
         result = detect_scan(scan.image, PARAMS, infrared=scan.infrared)
         self.assertEqual(result.source, "红外")
+        self.assertEqual([item.id for item in result.items], list(range(1, len(result.items) + 1)))
         # Three plainly visible defects in the sky, plus a bound on
         # false responses to the rock texture visible in the IR plane.
         for x, y in ((928, 118), (940, 544), (994, 781)):

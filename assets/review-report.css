@@ -1,0 +1,50 @@
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#151b22;color:#e5edf4}
+body{margin:2rem auto;max-width:1440px;padding:0 clamp(.7rem,2.5vw,2rem)}
+article{margin:1.4rem 0;padding:clamp(.65rem,1.8vw,1.2rem);background:#202830;border:1px solid #374552;border-radius:12px}
+h1,h2{margin:.2rem 0 .55rem;overflow-wrap:anywhere}
+h2{font-size:1.1rem}
+p{color:#a7b5c4}
+a{color:#80e0c9}
+button{border:1px solid #425463;border-radius:6px;background:#283541;color:inherit;padding:.38rem .65rem;font:inherit;cursor:pointer}
+button:hover{background:#354655}
+button[aria-pressed=true]{background:#254b48;border-color:#65c0ab}
+button:disabled{opacity:.45;cursor:default}
+:focus-visible{outline:2px solid #80e0c9;outline-offset:2px}
+[hidden]{display:none!important}
+.photo-head{display:flex;align-items:baseline;justify-content:space-between;gap:.6rem;flex-wrap:wrap}
+.toolbar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:.8rem 0}
+.toolbar output{min-width:3.5em;text-align:center;font-variant-numeric:tabular-nums}
+.mark-toggle,.split-control{display:inline-flex;gap:.4rem;align-items:center;padding:.3rem .55rem}
+input{accent-color:#70dbc4}
+.viewer{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.55rem;position:relative}
+.viewer.stack{grid-template-columns:minmax(0,1fr)}
+.viewport{position:relative;overflow:hidden;background:#111923;border:1px solid #3a4956;border-radius:8px;height:clamp(180px,40vw,530px);touch-action:pan-y}
+.viewer.is-zoomed .viewport{cursor:grab;touch-action:none}
+.viewer.is-dragging .viewport{cursor:grabbing}
+.stage{position:absolute;inset:0;user-select:none}
+.stage img,.stage svg{display:block;position:absolute;inset:0;width:100%;height:100%}
+.stage img{object-fit:contain;pointer-events:none;-webkit-user-drag:none}
+.viewer.interactive .stage img{object-fit:fill}
+.stage svg{overflow:hidden;pointer-events:none}
+.stage .marker{cursor:pointer;pointer-events:visiblePainted;color:#75e5cd}
+.stage .marker.pending{color:#ffc980}
+.marker path,.marker circle{fill:none;stroke:currentColor;stroke-width:1.5;vector-effect:non-scaling-stroke}
+.marker path{fill:currentColor;fill-opacity:.12;fill-rule:evenodd}
+.marker circle{fill:transparent}
+.marker.is-active path,.marker.is-active circle{stroke-width:2.5}
+.viewer.hide-marks .stage svg{display:none}
+.badge{position:absolute;z-index:3;top:.5rem;left:.5rem;background:#111923e8;border-radius:5px;padding:.23rem .5rem;pointer-events:none}
+.viewer.swipe{display:block}
+.viewer.swipe .after{position:absolute;inset:0;clip-path:inset(0 0 0 var(--split,50%))}
+.viewer.swipe .after .badge{left:auto;right:.5rem}
+.divider{display:none;position:absolute;z-index:4;top:0;bottom:0;left:var(--split,50%);width:24px;transform:translateX(-50%);cursor:ew-resize;touch-action:none}
+.divider::before{content:"";position:absolute;inset:0 auto 0 11px;width:2px;background:#c7f1e9}
+.divider::after{content:"";position:absolute;top:calc(50% - 17px);left:7px;width:10px;height:34px;border-radius:6px;background:#c7f1e9;box-shadow:0 1px 5px #101820}
+.viewer.swipe .divider{display:block}
+.defects{margin-top:.75rem}
+.defects summary{cursor:pointer;color:#c8d7df}
+.defect-list{display:flex;gap:.4rem;flex-wrap:wrap;max-height:10rem;overflow:auto;padding:.5rem .2rem}
+.defect-list button{font-size:.85rem}
+.defect-list .pending{color:#ffc980}
+.defect-list .applied{color:#80e0c9}
+@media(max-width:520px){.toolbar{font-size:.86rem}.viewport{height:clamp(155px,48vw,320px)}}

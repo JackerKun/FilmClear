@@ -69,6 +69,16 @@ QPushButton#textBtn {
     font-size: 11px;
 }
 QPushButton#textBtn:hover { color: $text; background: $hover; }
+QPushButton#photoFilterBtn {
+    background: $surface;
+    color: $muted;
+    border-color: $line;
+    padding: 0 2px;
+    min-height: 23px;
+    font-size: 11px;
+}
+QPushButton#photoFilterBtn:hover { background: $hover; color: $text; }
+QPushButton#photoFilterBtn:checked { background: $selection; border-color: $accent_line; color: $text; }
 QListWidget {
     background: $surface;
     color: $text;

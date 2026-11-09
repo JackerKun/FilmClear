@@ -21,7 +21,7 @@ def main():
     # 创建应用
     app = QApplication(sys.argv)
     app.setApplicationName("FilmClear")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.1.0")
     app.setOrganizationName("FilmClear")
     app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "filmclear.png")))
     
