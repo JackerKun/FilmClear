@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FilmClear local environments, settings, scans and exports
+/.venv-build/
+/filmclear_config.json
+/output/
+/demo/*
+!/demo/IR-SOURCE.md
+/models/u2net*.onnx

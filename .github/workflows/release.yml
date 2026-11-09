@@ -1,0 +1,121 @@
+name: Build and publish FilmClear
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS-arm64
+            runner: macos-15
+            entrypoint: dist/macos/FilmClear.app/Contents/MacOS/FilmClear
+          - platform: macOS-x64
+            runner: macos-15-intel
+            entrypoint: dist/macos/FilmClear.app/Contents/MacOS/FilmClear
+          - platform: Windows-x64
+            runner: windows-2025
+            entrypoint: dist/windows/FilmClear/FilmClear.exe
+          - platform: Linux-x64
+            runner: ubuntu-22.04
+            entrypoint: dist/linux/FilmClear/FilmClear
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0
+
+      - name: Build on macOS or Linux
+        if: runner.os != 'Windows'
+        run: ./build.sh
+
+      - name: Build on Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: call build.bat
+
+      - name: Check that the bundled application starts
+        shell: bash
+        env:
+          FILMCLEAR_EXECUTABLE: ${{ matrix.entrypoint }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from subprocess import Popen, TimeoutExpired
+          from tempfile import TemporaryDirectory
+
+          exe = Path(os.environ["FILMCLEAR_EXECUTABLE"]).resolve(strict=True)
+          with TemporaryDirectory() as workdir, Popen([str(exe)], cwd=workdir) as app:
+              try:
+                  status = app.wait(timeout=8)
+              except TimeoutExpired:
+                  app.terminate()
+              else:
+                  raise SystemExit(f"FilmClear exited during startup with status {status}")
+          PY
+
+      - name: Archive macOS app
+        if: runner.os == 'macOS'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p release
+          codesign --verify --deep --strict dist/macos/FilmClear.app
+          ditto -c -k --sequesterRsrc --keepParent dist/macos/FilmClear.app "release/FilmClear-${PLATFORM}.zip"
+
+      - name: Archive Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release
+          Compress-Archive -Path dist/windows/FilmClear -DestinationPath release/FilmClear-Windows-x64.zip
+
+      - name: Archive Linux app
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release
+          tar -czf release/FilmClear-Linux-x64.tar.gz -C dist/linux FilmClear
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FilmClear-${{ matrix.platform }}
+          path: release/FilmClear-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: FilmClear-*
+          merge-multiple: true
+          path: release
+      - name: Publish archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release && sha256sum FilmClear-* > SHA256SUMS.txt)
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "FilmClear $GITHUB_REF_NAME" --generate-notes

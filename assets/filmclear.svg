@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <title>FilmClear</title>
+  <desc>A film frame passing through a warm scan line. Dust on the left gives way to a clean image on the right.</desc>
+  <defs>
+    <linearGradient id="background" x1="64" y1="44" x2="460" y2="474" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#243743"/>
+      <stop offset="1" stop-color="#101B25"/>
+    </linearGradient>
+    <linearGradient id="film" x1="85" y1="123" x2="422" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4C9C93"/>
+      <stop offset="1" stop-color="#8FE5CC"/>
+    </linearGradient>
+    <linearGradient id="image" x1="245" y1="168" x2="360" y2="350" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#183D42"/>
+      <stop offset="1" stop-color="#0E252F"/>
+    </linearGradient>
+    <clipPath id="frame">
+      <rect x="148" y="158" width="216" height="196" rx="15"/>
+    </clipPath>
+  </defs>
+  <rect x="21" y="21" width="470" height="470" rx="104" fill="url(#background)" stroke="#394D59" stroke-width="4"/>
+  <rect x="83" y="121" width="346" height="270" rx="36" fill="url(#film)"/>
+  <rect x="148" y="158" width="216" height="196" rx="15" fill="url(#image)"/>
+  <g fill="#142933">
+    <rect x="101" y="163" width="29" height="41" rx="7"/>
+    <rect x="101" y="235" width="29" height="41" rx="7"/>
+    <rect x="101" y="307" width="29" height="41" rx="7"/>
+    <rect x="382" y="163" width="29" height="41" rx="7"/>
+    <rect x="382" y="235" width="29" height="41" rx="7"/>
+    <rect x="382" y="307" width="29" height="41" rx="7"/>
+  </g>
+  <g clip-path="url(#frame)">
+    <path d="M147 339l58-56c7-7 16-7 23-1l32 31 45-54c7-8 17-9 25 0l36 44v53H147z" fill="#559C96"/>
+    <path d="M242 356l66-72c7-7 16-7 23 1l35 40v31z" fill="#75C8B3"/>
+    <circle cx="321" cy="207" r="16" fill="#A4E7D0"/>
+    <path d="M147 157h109v199H147z" fill="#0D202B" opacity=".48"/>
+    <g fill="#D9EFE7">
+      <circle cx="183" cy="206" r="6"/>
+      <circle cx="222" cy="243" r="4"/>
+      <circle cx="192" cy="278" r="5"/>
+    </g>
+  </g>
+  <path d="M256 145v222" stroke="#FFCB80" stroke-width="10" stroke-linecap="round"/>
+</svg>
