@@ -74,6 +74,88 @@ def _aligned_edge(plane, slope):
     return slope, depths[index] - slope * width / 2, float(coverage[index])
 
 
+def _thin_edge(plane):
+    """Find a narrow matte without downsampling across the border itself."""
+    depth, length = plane.shape[:2]
+    limit = round(depth * 0.018)
+    if limit < 3:
+        return None
+    gap = min(6, max(1, round(depth * 0.0015)))
+    strip = display_pixels(np.ascontiguousarray(plane[:limit + gap + 1]))
+    if strip.ndim == 3:
+        strip = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    width = min(900, length)
+    # Average along the edge to suppress grain, keeping every row across it.
+    if width < length:
+        strip = cv2.resize(strip, (width, len(strip)), interpolation=cv2.INTER_AREA)
+    strip = cv2.blur(strip.astype(np.float32), (5, 1))
+    sums = np.vstack((np.zeros((1, width), np.float32), np.cumsum(strip, axis=0)))
+    rows = np.arange(2, limit + 1)
+    start = np.maximum(0, rows - gap)
+    before = (sums[rows] - sums[start]) / (rows - start)[:, None]
+    after = (sums[rows + gap] - sums[rows]) / gap
+    matte = sums[rows] / rows[:, None]
+    contrast = after - before
+    dark = (matte <= 24) & (before <= 34)
+    strong = dark & (after >= 24) & (contrast >= 12)
+    if np.count_nonzero(strong.any(axis=0)) < width * 0.14:
+        return None
+    weak = dark & (after >= 11) & (contrast >= 5)
+    lines = cv2.HoughLinesP(np.uint8(strong) * 255, 1, np.pi / 720, max(10, width // 28),
+                            minLineLength=max(9, width // 20), maxLineGap=max(4, width // 24))
+    if lines is None:
+        return None
+
+    columns = np.arange(width)
+    window = np.arange(-max(1, gap // 2), max(1, gap // 2) + 1)[:, None]
+
+    def support(slope, intercept):
+        prediction = np.rint(slope * columns + intercept).astype(int)
+        depths = prediction + window
+        valid = (depths >= rows[0]) & (depths <= rows[-1])
+        indices = np.clip(depths - rows[0], 0, len(rows) - 1)
+        reliable = valid & strong[indices, columns]
+        gradient = np.where(reliable, contrast[indices, columns], -1)
+        peaks = gradient.argmax(axis=0)
+        matched = gradient[peaks, columns] >= 0
+        return matched, depths[peaks, columns], (valid & weak[indices, columns]).any(axis=0)
+
+    best = None
+    for x1, y1, x2, y2 in lines[:, 0]:
+        if x1 == x2:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 + rows[0] - slope * x1
+        ends = intercept + slope * np.array((0, width - 1))
+        if min(ends) < 1 or max(ends) > limit + 1:
+            continue
+        matched, targets, softer = support(slope, intercept)
+        coverage = matched.mean()
+        if coverage < 0.14 or softer.mean() < 0.28:
+            continue
+        xs = columns[matched]
+        span = (xs[-1] - xs[0]) / width
+        # A local bright object at the edge must not establish a crop line.
+        if span < 0.48 and coverage < 0.52:
+            continue
+        fitted = np.polyfit(xs, targets[matched], 1)
+        sampled = np.clip(np.rint(np.polyval(fitted, columns)).astype(int) - rows[0], 0, len(rows) - 1)
+        if np.mean(matte[sampled, columns] <= 24) < 0.88:
+            continue
+        score = coverage + 0.2 * softer.mean() + 0.1 * span
+        if best is None or score > best[0]:
+            best = score, fitted, float(coverage)
+    if best is None:
+        return None
+    _, (slope, intercept), coverage = best
+    ends = intercept + slope * np.array((0, width - 1))
+    if min(ends) < -1 or max(ends) > limit + 1:
+        return None
+    # Recover the coordinate of the first original column after area averaging.
+    step = length / width
+    return slope / step, intercept - slope * (step - 1) / (2 * step), coverage
+
+
 def _sprocket_boundary(plane):
     """Fit the inside tips of a row of black holes, including cut-off holes."""
     height, width = plane.shape
@@ -105,6 +187,57 @@ def _after_sprockets(line, holes, width):
     return offsets.min() >= -2 and offsets.max() <= 0.10 * width
 
 
+_SIDES = ((1, False), (0, True), (1, True), (0, False))
+
+
+def _edge_coefficients(shape, axis, reverse, slope, intercept):
+    if reverse:
+        slope, intercept = -slope, shape[1 - axis] - 1 - intercept
+    return np.array((-slope, 1, -intercept) if axis == 1 else (1, -slope, -intercept))
+
+
+def _frame_lines(gray, defaults):
+    """Estimate the frame from multiple broad edges or opposing sprocket rows."""
+    edges, scores, sprockets = [], [], []
+    for axis, reverse in _SIDES:
+        plane = gray if axis == 1 else gray.T
+        plane = plane[::-1] if reverse else plane
+        sprockets.append(_sprocket_boundary(plane))
+        result = _edge_line(plane)
+        slope, intercept = result[0] if result is not None else (0.0, 0.0)
+        if result is not None and not _after_sprockets(result[0], sprockets[-1], plane.shape[1]):
+            result = None
+        edges.append(_edge_coefficients(gray.shape, axis, reverse, slope, intercept))
+        scores.append(result[1] if result is not None else 0.0)
+    confirmed_film = any(sprockets[i] is not None and sprockets[i + 2] is not None for i in (0, 1))
+    if not any(scores) and not confirmed_film:
+        return None
+    # Scanner edges share one orientation. Scene roofs and shadows often do not.
+    angles = np.arctan((-edges[0][0], edges[1][1], -edges[2][0], edges[3][1]))
+    votes = np.asarray(scores)
+    agreement = np.abs(angles[:, None] - angles[None, :]) < 0.018
+    direction = int(np.argmax(agreement @ votes))
+    for index, (axis, reverse) in enumerate(_SIDES):
+        if scores[index] and (agreement[direction, index]
+                              or (sprockets[index] is not None and scores[index] >= 0.65)):
+            continue
+        plane = gray if axis == 1 else gray.T
+        slope = np.tan(angles[direction]) * (1 if axis == 1 else -1) * (-1 if reverse else 1)
+        weak = _aligned_edge(plane[::-1] if reverse else plane, slope)
+        holes = sprockets[index]
+        if weak is None or not _after_sprockets(weak, holes, plane.shape[1]):
+            scores[index] = 0.0
+            edges[index] = (_edge_coefficients(gray.shape, axis, reverse, holes[0], holes[1] + 2)
+                            if confirmed_film and holes is not None else np.array(defaults[index], float))
+        else:
+            edges[index] = _edge_coefficients(gray.shape, axis, reverse, *weak[:2])
+            scores[index] = weak[2]
+    count = sum(score > 0 for score in scores)
+    if not confirmed_film and (count < 2 or sum(scores) < (1.3 if count == 2 else 1.6)):
+        return None
+    return edges, scores, confirmed_film
+
+
 def detect_frame(image):
     """Return clockwise exposure corners, or None when evidence is insufficient."""
     height, width = image.shape[:2]
@@ -117,50 +250,26 @@ def detect_frame(image):
     thumb = display_pixels(cv2.resize(image, size, interpolation=cv2.INTER_AREA) if scale < 1 else image)
     gray = cv2.cvtColor(thumb, cv2.COLOR_BGR2GRAY) if thumb.ndim == 3 else thumb
     h, w = gray.shape
-    sides = ((1, False), (0, True), (1, True), (0, False))
-    edges, scores, sprockets = [], [], []
-
-    def coefficients(axis, reverse, slope, intercept):
-        if reverse:
-            slope, intercept = -slope, gray.shape[0 if axis == 1 else 1] - 1 - intercept
-        return np.array((-slope, 1, -intercept) if axis == 1 else (1, -slope, -intercept))
-
-    for axis, reverse in sides:
-        plane = gray if axis == 1 else gray.T
-        plane = plane[::-1] if reverse else plane
-        sprockets.append(_sprocket_boundary(plane))
-        result = _edge_line(plane)
-        slope, intercept = result[0] if result is not None else (0.0, 0.0)
-        if result is not None and not _after_sprockets(result[0], sprockets[-1], plane.shape[1]):
-            result = None
-        edges.append(coefficients(axis, reverse, slope, intercept))
-        scores.append(result[1] if result is not None else 0.0)
-    confirmed_film = any(sprockets[i] is not None and sprockets[i + 2] is not None for i in (0, 1))
-    if not any(scores) and not confirmed_film:
-        return None
-    # Scanner edges share one orientation. Scene roofs and shadows often do not.
-    angles = np.arctan((-edges[0][0], edges[1][1], -edges[2][0], edges[3][1]))
-    votes = np.asarray(scores)
-    agreement = np.abs(angles[:, None] - angles[None, :]) < 0.018
-    direction = int(np.argmax(agreement @ votes))
-    defaults = ((0, 1, 0), (1, 0, -(w - 1)), (0, 1, -(h - 1)), (1, 0, 0))
-    for index, (axis, reverse) in enumerate(sides):
-        if scores[index] and (agreement[direction, index]
-                              or (sprockets[index] is not None and scores[index] >= 0.65)):
+    defaults = np.array(((0, 1, 0), (1, 0, -(w - 1)), (0, 1, -(h - 1)), (1, 0, 0)), dtype=float)
+    frame = _frame_lines(gray, defaults)
+    edges, scores, confirmed_film = frame if frame is not None else (list(defaults), [0.0] * 4, False)
+    native_scale = (np.array((height, width)) - 1) / (np.array((h, w)) - 1)
+    for index, (axis, reverse) in enumerate(_SIDES):
+        # Perforated scans already use a different physical reference. A strip
+        # at their outside edge may be the film base, not the exposure window.
+        if confirmed_film or scores[index]:
             continue
-        plane = gray if axis == 1 else gray.T
-        slope = np.tan(angles[direction]) * (1 if axis == 1 else -1) * (-1 if reverse else 1)
-        weak = _aligned_edge(plane[::-1] if reverse else plane, slope)
-        holes = sprockets[index]
-        if weak is None or not _after_sprockets(weak, holes, plane.shape[1]):
-            scores[index] = 0.0
-            edges[index] = (coefficients(axis, reverse, holes[0], holes[1] + 2)
-                            if confirmed_film and holes is not None else np.array(defaults[index], float))
-        else:
-            edges[index] = coefficients(axis, reverse, *weak[:2])
-            scores[index] = weak[2]
+        plane = image if axis == 1 else image.swapaxes(0, 1)
+        narrow = _thin_edge(plane[::-1] if reverse else plane)
+        if narrow is None:
+            continue
+        slope, intercept, coverage = narrow
+        depth_scale = native_scale[1 - axis]
+        edges[index] = _edge_coefficients(gray.shape, axis, reverse,
+                                          slope * native_scale[axis] / depth_scale, intercept / depth_scale)
+        scores[index] = coverage
     count = sum(score > 0 for score in scores)
-    if not confirmed_film and (count < 2 or sum(scores) < (1.3 if count == 2 else 1.6)):
+    if frame is None and not count:
         return None
     corners = []
     for first, second in ((3, 0), (0, 1), (1, 2), (2, 3)):
@@ -175,7 +284,7 @@ def detect_frame(image):
             or cv2.contourArea(corners) < 0.50 * w * h):
         return None
     corners = np.clip(corners, (0, 0), (w - 1, h - 1))
-    corners *= np.array(((width - 1) / (w - 1), (height - 1) / (h - 1)))
+    corners *= native_scale[::-1]
     return {"corners": corners.tolist(),
             "confidence": float(np.mean(scores)), "detected_edges": int(count)}
 

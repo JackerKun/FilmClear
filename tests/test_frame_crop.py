@@ -39,6 +39,31 @@ class FrameCropTest(unittest.TestCase):
         image[:38] = 5
         self.assertIsNone(detect_frame(image))
 
+    def test_thin_single_matte_is_found_across_a_dark_subject(self):
+        height, width = 1200, 1800
+        image = np.full((height, width, 3), 7, np.uint8)
+        scene = np.full((width, 3), 19, np.uint8)
+        scene[:310] = 95
+        scene[-350:] = 152
+        depths = np.rint(np.linspace(8, 17, width)).astype(int)
+        for x, y in enumerate(depths):
+            image[y:, x] = scene[x]
+
+        detected = detect_frame(image)
+        self.assertIsNotNone(detected)
+        self.assertEqual(detected["detected_edges"], 1)
+        corners = np.asarray(detected["corners"])
+        np.testing.assert_allclose(corners[:2, 1], depths[[0, -1]], atol=2)
+        np.testing.assert_allclose(corners[2:, 1], height - 1)
+        crop = crop_from_edges(image.shape, corners)
+        self.assertEqual(apply_crop(image, crop).shape[1], width)
+        self.assertLessEqual(abs(apply_crop(image, crop).shape[0] - (height - depths[-1])), 2)
+
+        # A small patch near the edge has too little support for a matte.
+        local = np.full_like(image, 7)
+        local[12:, 750:940] = 120
+        self.assertIsNone(detect_frame(local))
+
     def test_cut_off_sprocket_rows_allow_a_safe_estimate_for_a_dark_frame(self):
         image = np.full((500, 740, 3), 8, np.uint8)
         for x in range(30, 730, 88):

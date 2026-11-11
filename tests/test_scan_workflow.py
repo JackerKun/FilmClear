@@ -8,7 +8,7 @@ import tifffile
 
 from core.batch_export import SOURCE_FORMAT, ExportEntry, export_batch
 from core.dust_remover import DustRemover
-from core.frame_crop import detect_frame
+from core.frame_crop import crop_from_edges, detect_frame
 from core.manual_retouch import retouch_patch
 from core.scene_focus import SceneFocus
 from core.scan_detection import detect_brush, detect_scan
@@ -36,6 +36,17 @@ class ScanWorkflowTest(unittest.TestCase):
         corners = np.asarray(crop["corners"]) / (w, h)
         expected = ((0.017, 0.019), (0.979, 0.018), (0.981, 0.979), (0.018, 0.980))
         np.testing.assert_allclose(corners, expected, rtol=0, atol=0.004)
+
+    def test_thin_top_matte_in_dark_portraits_preserves_other_edges(self):
+        for name, expected_top in (("2026-10-29-0007.jpg", 35), ("2026-10-29-0008.jpg", 38)):
+            with self.subTest(name=name):
+                image = read_scan(self.demo_path(name), read_ir=False).image
+                result = detect_frame(image)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["detected_edges"], 1)
+                left, top, right, bottom = crop_from_edges(image.shape, result["corners"])["rect"]
+                self.assertAlmostEqual(top, expected_top, delta=3)
+                self.assertEqual((left, right, bottom), (0, image.shape[1], image.shape[0]))
 
     def test_vuescan_rgbi_and_ordinary_alpha(self):
         with TemporaryDirectory() as directory:
