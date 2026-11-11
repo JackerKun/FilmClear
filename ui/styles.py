@@ -7,6 +7,7 @@ QMainWindow, QWidget#workspace { background: $window; color: $text; }
 QWidget#sidebar { background: $panel; }
 QDialog#exportDialog { background: $panel; color: $text; }
 QLabel { background: transparent; color: $text; font-size: 13px; }
+QCheckBox { background: transparent; color: $text; font-size: 12px; }
 QLabel#titleLabel { font-size: 17px; font-weight: 650; }
 QLabel#sectionLabel { font-size: 12px; font-weight: 650; color: $text; }
 QLabel#subtitleLabel, QLabel#zoomLabel { font-size: 11px; color: $muted; }
@@ -109,12 +110,14 @@ QListWidget#fileList { background: transparent; border: none; padding: 0; }
 QListWidget::item { padding: 5px 6px; min-height: 22px; border-radius: 5px; }
 QListWidget::item:selected { background: $selection; color: $text; }
 QListWidget::item:hover:!selected { background: $hover; }
-QTreeWidget#shortcutList {
+QTreeWidget#shortcutList, QTreeWidget#batchCropList {
     background: $surface; color: $text; border: 1px solid $line; border-radius: 8px;
 }
-QTreeWidget#shortcutList::item { min-height: 25px; }
-QTreeWidget#shortcutList::item:selected { background: $selection; color: $text; }
-QTreeWidget#shortcutList QHeaderView::section {
+QTreeWidget#shortcutList::item, QTreeWidget#batchCropList::item { min-height: 25px; }
+QTreeWidget#shortcutList::item:selected, QTreeWidget#batchCropList::item:selected {
+    background: $selection; color: $text;
+}
+QTreeWidget#shortcutList QHeaderView::section, QTreeWidget#batchCropList QHeaderView::section {
     background: $panel; color: $muted; border: none; border-bottom: 1px solid $line; padding: 7px;
 }
 QTreeWidget#shortcutList QScrollBar:vertical, QPlainTextEdit#noticeDetails QScrollBar:vertical {
@@ -131,7 +134,7 @@ QTreeWidget#shortcutList QScrollBar::add-page:vertical,
 QPlainTextEdit#noticeDetails QScrollBar::add-page:vertical,
 QPlainTextEdit#noticeDetails QScrollBar::sub-page:vertical,
 QTreeWidget#shortcutList QScrollBar::sub-page:vertical { background: transparent; }
-QComboBox, QSpinBox, QLineEdit {
+QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
     background: $surface;
     color: $text;
     border: 1px solid $line;

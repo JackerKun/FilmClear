@@ -4,15 +4,17 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap, QTransform
-from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QRubberBand
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QRubberBand
 
 
 from core.scan_io import display_pixels
+from core.frame_crop import crop_plan
 
 
 RETOUCH_MODES = ("clone", "spot")
 STROKE_MODES = ("draw", *RETOUCH_MODES)
+DEFAULT_CANVAS_BACKGROUND = "#222a33"
 
 
 def photo_pixmap(image):
@@ -36,9 +38,16 @@ def defect_path(dust):
     return path
 
 
+class ClippedPhoto(QGraphicsPixmapItem):
+    crop_path = None
+
+    def shape(self):
+        return self.crop_path if self.crop_path is not None else super().shape()
+
+
 class ImageViewer(QGraphicsView):
     annotation_clicked = Signal(int)
-    annotation_right_clicked = Signal(int, object)
+    canvas_menu_requested = Signal(object, object)
     region_selected = Signal(int, int, int, int, bool)
     stroke_drawn = Signal(object)
     sample_requested = Signal(object)
@@ -49,7 +58,9 @@ class ImageViewer(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScene(QGraphicsScene(self))
-        self._photo = self.scene().addPixmap(QPixmap())
+        self._photo = ClippedPhoto()
+        self.scene().addItem(self._photo)
+        self._geometry = None
         self._photo.setTransformationMode(Qt.SmoothTransformation)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
@@ -86,20 +97,30 @@ class ImageViewer(QGraphicsView):
         self._update_tool_cursor()
 
     def load_image(self, image):
+        self.load_pixmap(photo_pixmap(image))
+
+    def load_pixmap(self, pixmap):
+        self._geometry = None
         self.clone_source = None
         self._cancel_selection()
         self.clear_comparison()
         self.update_annotations([])
-        self.replace_image(image)
+        self._replace_pixmap(pixmap)
         self.fit_to_window()
 
     def replace_image(self, image):
-        self._photo.setPixmap(photo_pixmap(image))
-        self.setSceneRect(QRectF(self._photo.pixmap().rect()))
+        self._replace_pixmap(photo_pixmap(image))
+
+    def _replace_pixmap(self, pixmap):
+        self._photo.setPixmap(pixmap)
+        self.set_geometry(self._geometry, fit=False)
         self._update_tool_cursor()
         self.viewport().update()
 
     def clear_image(self):
+        self._geometry = None
+        self._photo.crop_path = None
+        self._photo.setTransform(QTransform())
         self.clone_source = None
         self._cancel_selection()
         self.clear_comparison()
@@ -111,6 +132,36 @@ class ImageViewer(QGraphicsView):
     def get_image_size(self):
         bounds = self._photo.boundingRect()
         return int(bounds.width()), int(bounds.height())
+
+    def set_canvas_background(self, color):
+        self.setBackgroundBrush(QBrush(QColor(color or DEFAULT_CANVAS_BACKGROUND)))
+
+    def set_geometry(self, settings, *, fit=True):
+        self._geometry = settings
+        bounds = self._photo.pixmap().rect()
+        if settings is None:
+            self._photo.crop_path = None
+            self._photo.setFlag(QGraphicsItem.ItemClipsToShape, False)
+            self._photo.setTransform(QTransform())
+            self.setSceneRect(QRectF(bounds))
+        else:
+            points, matrix, (width, height), _ = crop_plan((bounds.height(), bounds.width()), settings)
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([QPointF(float(x), float(y)) for x, y in points]))
+            path.closeSubpath()
+            self._photo.crop_path = path
+            self._photo.setFlag(QGraphicsItem.ItemClipsToShape, True)
+            self._photo.setTransform(QTransform(*matrix.T.ravel()))
+            self.setSceneRect(0, 0, width, height)
+        if fit:
+            self.fit_to_window()
+        self.viewport().update()
+
+    def image_point(self, pos):
+        return self._photo.mapFromScene(self.mapToScene(pos))
+
+    def image_position(self, point):
+        return self.mapFromScene(self._photo.mapToScene(QPointF(*point)))
 
     def update_annotations(self, dust_items):
         self._items = {item.id: item for item in dust_items}
@@ -131,7 +182,7 @@ class ImageViewer(QGraphicsView):
         if locate:
             if self.transform().m11() < min_zoom:
                 self._zoom_to(min_zoom)
-            self.centerOn(*dust.center)
+            self.centerOn(self._photo.mapToScene(QPointF(*dust.center)))
         self.viewport().update()
 
     def reset_highlight(self):
@@ -164,17 +215,25 @@ class ImageViewer(QGraphicsView):
         if self._photo.pixmap().isNull():
             painter.save()
             painter.resetTransform()
-            painter.setPen(QColor("#9eacbc"))
+            light = self.backgroundBrush().color().lightness() > 150
+            painter.setPen(QColor("#36434e" if light else "#b4c3d0"))
             painter.drawText(self.viewport().rect(), Qt.AlignCenter,
                              "导入胶片扫描照片\n在左侧添加照片或打开文件夹")
             painter.restore()
             return
 
+        painter.save()
+        painter.setWorldTransform(self._photo.sceneTransform(), True)
+        if self._photo.crop_path is not None:
+            painter.setClipPath(self._photo.crop_path, Qt.IntersectClip)
+        rect = self._photo.mapFromScene(rect).boundingRect()
         if not self._before.isNull():
             self._draw_comparison(painter, rect)
+            painter.restore()
             return
         if self.comparison_label:
             self._draw_marks(painter, rect, self._before_marks)
+            painter.restore()
             self._draw_badge(painter)
             return
 
@@ -207,6 +266,7 @@ class ImageViewer(QGraphicsView):
                 painter.drawPoint(self._stroke[0])
         if self._selection_mode in STROKE_MODES and not self.space_pan:
             self._draw_brush_cursor(painter)
+        painter.restore()
         painter.restore()
 
     def _draw_brush_cursor(self, painter):
@@ -264,7 +324,9 @@ class ImageViewer(QGraphicsView):
         view = self.viewport().rect()
         split = round(view.width() * self._split / 100)
         painter.save()
-        painter.setClipRect(self.mapToScene(QRect(0, 0, split, view.height())).boundingRect())
+        clip = QPainterPath()
+        clip.addPolygon(self._photo.mapFromScene(self.mapToScene(QRect(0, 0, split, view.height()))))
+        painter.setClipPath(clip, Qt.IntersectClip)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.drawPixmap(0, 0, self._before)
         self._draw_marks(painter, rect, self._before_marks)
@@ -272,6 +334,7 @@ class ImageViewer(QGraphicsView):
 
         painter.save()
         painter.resetTransform()
+        painter.setClipping(False)
         painter.setPen(QPen(QColor("#dce8f3"), 1))
         painter.drawLine(split, 0, split, view.height())
         painter.setPen(Qt.NoPen)
@@ -406,8 +469,8 @@ class ImageViewer(QGraphicsView):
 
     def _brush_position(self):
         if self._pointer_pos is not None and self.viewport().rect().contains(self._pointer_pos):
-            point = self.mapToScene(self._pointer_pos)
-            if self.sceneRect().contains(point):
+            point = self.image_point(self._pointer_pos)
+            if self._photo.shape().contains(point):
                 return point
         return None
 
@@ -437,8 +500,8 @@ class ImageViewer(QGraphicsView):
         self.viewport().update()
 
     def _stroke_point(self, pos):
-        point = self.mapToScene(pos)
-        bounds = self.sceneRect()
+        point = self.image_point(pos)
+        bounds = self._photo.boundingRect()
         return QPointF(min(max(0, point.x()), bounds.width() - 1),
                        min(max(0, point.y()), bounds.height() - 1))
 
@@ -459,7 +522,7 @@ class ImageViewer(QGraphicsView):
                 self._update_tool_cursor()
                 return
             if self._selection_mode in STROKE_MODES:
-                if self.sceneRect().contains(self.mapToScene(pos)):
+                if self._photo.shape().contains(self.image_point(pos)):
                     point = self._stroke_point(pos)
                     if (self._selection_mode == "clone"
                             and event.modifiers() & Qt.AltModifier):
@@ -528,8 +591,8 @@ class ImageViewer(QGraphicsView):
                 return
             if self._selection_mode and start is not None:
                 self._box.hide()
-                box = self.mapToScene(QRect(start, pos).normalized()).boundingRect()
-                box = box.intersected(self.sceneRect()).toAlignedRect()
+                box = self._photo.mapFromScene(self.mapToScene(QRect(start, pos).normalized())).boundingRect()
+                box = box.intersected(self._photo.boundingRect()).toAlignedRect()
                 if box.width() >= 3 and box.height() >= 3:
                     self.region_selected.emit(box.x(), box.y(),
                                               box.x() + box.width(), box.y() + box.height(),
@@ -543,11 +606,9 @@ class ImageViewer(QGraphicsView):
         self._update_tool_cursor()
 
     def contextMenuEvent(self, event):
-        if self._selection_mode in RETOUCH_MODES:
-            return
-        dust_id = self._annotation_at(event.pos())
-        if dust_id is not None:
-            self.annotation_right_clicked.emit(dust_id, event.globalPos())
+        dust_id = None if self._selection_mode in RETOUCH_MODES else self._annotation_at(event.pos())
+        self.canvas_menu_requested.emit(dust_id, event.globalPos())
+        event.accept()
 
     def _annotation_at(self, pos):
         if not self._before.isNull() or self.comparison_label:
@@ -556,7 +617,7 @@ class ImageViewer(QGraphicsView):
         best_distance = 10
         for item in self._items.values():
             if self._show_all or item.id == self._focus_id:
-                distance = (self.mapFromScene(QPointF(*item.center)) - pos).manhattanLength()
+                distance = (self.image_position(item.center) - pos).manhattanLength()
                 if distance < best_distance:
                     best, best_distance = item.id, distance
         return best

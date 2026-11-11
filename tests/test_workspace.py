@@ -15,14 +15,201 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QMenu, QTreeWidget
 
 from config import Config
+from core.frame_crop import apply_crop, crop_plan
 from core.dust_item import DustItem
 from core.native_detector import NativeDustDetector
+from ui.batch_crop_dialog import BatchCropDialog
 from ui.image_viewer import RETOUCH_MODES
+from ui.crop_dialog import CropDialog
 from ui.main_window import MainWindow
 from ui.notice_dialog import NoticeDialog
 
 
 class WorkspaceTest(unittest.TestCase):
+    def test_batch_crop_can_apply_only_confirmed_frames_and_reset_selected_crops(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):
+            paths = [str(Path(directory).resolve() / name)
+                     for name in ("a-full.png", "b-review.png", "c-review.png", "d-skip.png")]
+            dark = np.full((300, 460, 3), 8, np.uint8)
+            framed = dark.copy()
+            framed[30:270, 35:425] = (105, 132, 170)
+            for path, image in zip(paths, (framed, dark, dark, dark)):
+                cv2.imwrite(path, image)
+
+            checks = {}
+
+            def confirm(crop):
+                checks["review_options"] = (crop.border.value(), crop.aspect.currentData())
+                crop.rotation.setValue(0.6)
+                crop.next.click()
+                checks["next"] = crop.title.text()
+                crop.previous.click()
+                checks["restored_rotation"] = crop.rotation.value()
+                crop.apply_button.click()
+                checks["after_confirmation"] = crop.title.text()
+                crop.apply_button.click()
+                checks["returned_at"] = crop.title.text()
+                crop.rotation.setValue(1.2)
+                return QDialog.Rejected
+
+            def run_dialog(dialog):
+                if dialog._results is None:
+                    checks["initial"] = dialog.selection()
+                    dialog.border.setValue(2)
+                    dialog.aspect.setCurrentIndex(dialog.aspect.findData("135"))
+                else:
+                    checks["before_apply"] = window._crop
+                    dialog.select_all.click()
+                    checks["before_review"] = dialog.selection()
+                    dialog.photos.setCurrentItem(dialog._rows[paths[1]])
+                    dialog.review_button.click()
+                    checks["after_review"] = dialog.selection()
+                    checks["summary"] = dialog.summary.text()
+                    dialog.select_confirmed.click()
+                    checks["confirmed_only"] = dialog.selection()
+                return QDialog.Accepted
+
+            def reset_dialog(dialog):
+                dialog._rows[paths[2]].setCheckState(0, Qt.Checked)
+                checks["reset_selection"] = dialog.reset_selection()
+                dialog.reset_button.click()
+                return dialog.result()
+
+            def wait():
+                deadline = time.monotonic() + 5
+                while window._job is not None and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                app.processEvents()
+                self.assertIsNone(window._job)
+
+            window = MainWindow()
+            window.show()
+            window.file_panel.load_files(paths)
+            wait()
+            with patch.object(BatchCropDialog, "exec", run_dialog), patch.object(CropDialog, "exec", confirm):
+                window.btn_batch_crop.click()
+                wait()
+            self.assertEqual(checks["initial"], paths)
+            self.assertIsNone(checks["before_apply"])
+            self.assertEqual(checks["before_review"], paths[:1])
+            self.assertCountEqual(checks["after_review"], paths[:3])
+            self.assertIn("手动确认 2 · 自动识别 1", checks["summary"])
+            self.assertEqual(checks["confirmed_only"], paths[1:3])
+            self.assertEqual(checks["review_options"], (2.0, "135"))
+            self.assertEqual(checks["next"], "c-review.png")
+            self.assertEqual(checks["restored_rotation"], 0.6)
+            self.assertEqual(checks["after_confirmation"], "c-review.png")
+            self.assertEqual(checks["returned_at"], "d-skip.png")
+            self.assertIsNone(window._crop)
+            self.assertNotIn(paths[3], window._photos)
+            expected = window._photos[paths[1]].crop
+            self.assertEqual(expected["border_percent"], 2)
+            self.assertEqual(expected["rotation"], 0.6)
+            second = window._photos[paths[2]].crop
+            window.close()
+
+            window = MainWindow()
+            window.show()
+            app.processEvents()
+            wait()
+            window._on_file_selected(paths[1])
+            wait()
+            self.assertEqual(window._crop, expected)
+            window._undo()
+            self.assertIsNone(window._crop)
+            window._redo()
+            self.assertEqual(window._crop, expected)
+            with patch.object(BatchCropDialog, "exec", reset_dialog):
+                window.btn_batch_crop.click()
+            self.assertEqual(checks["reset_selection"], [paths[2]])
+            self.assertEqual(window._crop, expected)
+            self.assertIsNone(window._photos[paths[2]].crop)
+            window._on_file_selected(paths[2])
+            wait()
+            self.assertEqual(window.image_viewer.sceneRect().width(), framed.shape[1])
+            window._undo()
+            self.assertEqual(window._crop, second)
+            window.close()
+
+    def test_crop_survives_reopen_and_exports_after_source_pixel_repairs(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):
+            path = Path(directory) / "film.png"
+            image = np.full((300, 460, 3), 1000, np.uint16)
+            image[30:270, 35:425] = (21000, 27000, 34000)
+            image[100:120, 110:130] = (31000, 38000, 43000)
+            cv2.imwrite(str(path), image)
+
+            def wait(window):
+                deadline = time.monotonic() + 5
+                while window._job is not None and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                self.assertIsNone(window._job)
+
+            initial_border = []
+
+            def accept_crop():
+                dialog = app.activeModalWidget()
+                if isinstance(dialog, CropDialog):
+                    initial_border.append(dialog.border.value())
+                    dialog.border.setValue(2)
+                    dialog.apply_button.click()
+
+            window = MainWindow()
+            window.show()
+            window.file_panel.load_files([path])
+            wait(window)
+            QTimer.singleShot(0, accept_crop)
+            window.btn_crop.click()
+            self.assertEqual(initial_border, [0])
+            settings = window._crop
+            self.assertEqual(settings["border_percent"], 2)
+            viewer = window.image_viewer
+            _, _, (width, height), _ = crop_plan(image.shape, settings)
+            self.assertEqual((viewer.sceneRect().width(), viewer.sceneRect().height()), (width, height))
+            viewer.zoom_100()
+            window.edit_buttons["clone"].click()
+            QTest.mouseClick(viewer.viewport(), Qt.LeftButton, Qt.AltModifier, viewer.image_position((120, 110)))
+            QTest.mouseClick(viewer.viewport(), Qt.LeftButton, pos=viewer.image_position((240, 155)))
+            wait(window)
+            np.testing.assert_array_equal(window._current_image[155, 240], image[110, 120])
+            edited = window._current_image.copy()
+            output = path.parent / "exports"
+            window._start_export([str(path)], output, ".png", "edited", include_review=True)
+            wait(window)
+            np.testing.assert_array_equal(cv2.imread(str(output / "film_clean.png"), cv2.IMREAD_UNCHANGED),
+                                          apply_crop(edited, settings))
+            report = window._last_review_report.read_text(encoding="utf-8")
+            self.assertIn(f'data-width="{width}" data-height="{height}"', report)
+            self.assertIn("已修复区域", report)
+            np.testing.assert_array_equal(cv2.imread(str(path), cv2.IMREAD_UNCHANGED), image)
+            window.close()
+
+            window = MainWindow()
+            window.show()
+            app.processEvents()
+            wait(window)
+            self.assertEqual(window._crop, settings)
+            np.testing.assert_array_equal(window._current_image, edited)
+            window.cancel_crop_action.trigger()
+            self.assertIsNone(window._crop)
+            self.assertEqual(window.image_viewer.sceneRect().width(), image.shape[1])
+            np.testing.assert_array_equal(window._current_image, edited)
+            window._undo()
+            self.assertEqual(window._crop, settings)
+            window._undo()
+            np.testing.assert_array_equal(window._current_image, image)
+            self.assertEqual(window._crop, settings)
+            window._undo()
+            self.assertIsNone(window._crop)
+            self.assertEqual(window.image_viewer.sceneRect().width(), image.shape[1])
+            window._redo()
+            self.assertEqual(window._crop, settings)
+            window.close()
+
     def test_sidebar_folding_preserves_widths_and_restores_layout(self):
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):

@@ -68,14 +68,27 @@ def _png_chunk(kind, data):
     return pack(">I", len(data)) + kind + data + pack(">I", crc32(kind + data))
 
 
-def write_repaired(output, image, suffix, metadata):
+def write_repaired(output, image, suffix, metadata, *, geometry_changed=False):
+    exif = metadata.exif
+    if exif and geometry_changed and suffix in (".jpg", ".jpeg", ".webp", ".png"):
+        tags = Image.Exif()
+        tags.load(exif)
+        if 34665 in tags:
+            dimensions = tags.get_ifd(34665)
+            for tag, value in ((40962, image.shape[1]), (40963, image.shape[0])):
+                if tag in dimensions:
+                    dimensions[tag] = value
+        for tag, value in ((40962, image.shape[1]), (40963, image.shape[0])):
+            if tag in tags:
+                tags[tag] = value
+        exif = tags.tobytes()
     if suffix in (".jpg", ".jpeg", ".webp"):
         pixels = Image.fromarray(cv2.cvtColor(display_pixels(image), cv2.COLOR_BGR2RGB))
         options = {}
         if metadata.icc:
             options["icc_profile"] = metadata.icc
-        if metadata.exif:
-            options["exif"] = metadata.exif
+        if exif:
+            options["exif"] = exif
         if suffix == ".webp":
             pixels.save(output, format="WEBP", lossless=True, **options)
         else:
@@ -103,12 +116,12 @@ def write_repaired(output, image, suffix, metadata):
     if not ok:
         raise ValueError("图片编码失败")
     data = memoryview(buffer)
-    if suffix == ".png" and (metadata.icc or metadata.exif or metadata.dpi):
+    if suffix == ".png" and (metadata.icc or exif or metadata.dpi):
         output.write(data[:33])  # PNG signature and IHDR.
         if metadata.icc:
             output.write(_png_chunk(b"iCCP", b"FilmClear ICC\0\0" + compress(metadata.icc)))
-        if metadata.exif:
-            output.write(_png_chunk(b"eXIf", metadata.exif.removeprefix(b"Exif\0\0")))
+        if exif:
+            output.write(_png_chunk(b"eXIf", exif.removeprefix(b"Exif\0\0")))
         if metadata.dpi:
             x, y = (round(value / 0.0254) for value in metadata.dpi)
             output.write(_png_chunk(b"pHYs", pack(">IIB", x, y, 1)))

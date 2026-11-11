@@ -15,6 +15,7 @@ from PIL import Image
 
 from .batch_export import publish_file
 from .export_metadata import read_metadata
+from .frame_crop import apply_crop, crop_plan
 from .scan_io import display_pixels, read_scan, signature
 
 _ASSETS = Path(__file__).resolve().parents[1] / "assets"
@@ -95,9 +96,18 @@ def _patched_regions(patches, shape):
 
 def _marks(entry, mode, shape):
     height, width = shape
+    matrix = None
+    if entry.crop is not None:
+        _, matrix, (width, height), _ = crop_plan(shape, entry.crop)
     marks = []
 
     def add(box, contours, label, status):
+        if matrix is not None:
+            x, y, w, h = box
+            source = contours or (np.float32(((x, y), (x + w, y), (x + w, y + h), (x, y + h))).reshape(-1, 1, 2),)
+            contours = tuple(np.rint(cv2.transform(contour.astype(np.float32), matrix[:2])).astype(np.int32)
+                             for contour in source)
+            box = cv2.boundingRect(contours[0])
         x, y, w, h = map(int, box)
         if min(w, h) <= 0 or x >= width or y >= height or x + w <= 0 or y + h <= 0:
             return
@@ -124,10 +134,13 @@ def _marks(entry, mode, shape):
 def _previews(path, *, marks=None, entry=None, mode=None, expected_shape=None):
     pixels = read_scan(path, read_ir=False).image
     shape = pixels.shape[:2]
-    if expected_shape is not None and shape != expected_shape:
-        raise ValueError("原片与导出结果尺寸不一致")
     if marks is None:
         marks = _marks(entry, mode, shape)
+    if entry is not None:
+        pixels = apply_crop(pixels, entry.crop)
+        shape = pixels.shape[:2]
+    if expected_shape is not None and shape != expected_shape:
+        raise ValueError("原片与导出结果尺寸不一致")
     icc = read_metadata(path).icc
     for mark in marks:
         x, y, width, height = mark["crop"]

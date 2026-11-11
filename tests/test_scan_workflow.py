@@ -8,6 +8,7 @@ import tifffile
 
 from core.batch_export import SOURCE_FORMAT, ExportEntry, export_batch
 from core.dust_remover import DustRemover
+from core.frame_crop import detect_frame
 from core.manual_retouch import retouch_patch
 from core.scene_focus import SceneFocus
 from core.scan_detection import detect_brush, detect_scan
@@ -25,6 +26,16 @@ class ScanWorkflowTest(unittest.TestCase):
         if not path.is_file():
             self.skipTest(f"Local scan fixture is unavailable: {name}")
         return path
+
+    def test_medium_format_frame_uses_exposure_edges_without_sprockets(self):
+        scan = read_scan(self.demo_path("2026-10-28-0009.jpg"), read_ir=False)
+        crop = detect_frame(scan.image)
+        self.assertIsNotNone(crop)
+        self.assertEqual(crop["detected_edges"], 4)
+        h, w = scan.image.shape[:2]
+        corners = np.asarray(crop["corners"]) / (w, h)
+        expected = ((0.017, 0.019), (0.979, 0.018), (0.981, 0.979), (0.018, 0.980))
+        np.testing.assert_allclose(corners, expected, rtol=0, atol=0.004)
 
     def test_vuescan_rgbi_and_ordinary_alpha(self):
         with TemporaryDirectory() as directory:

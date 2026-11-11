@@ -13,7 +13,7 @@ import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QProcess, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QApplication, QBoxLayout, QButtonGroup, QComboBox, QDialog,
+    QAbstractSpinBox, QApplication, QBoxLayout, QButtonGroup, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
     QProgressBar, QPushButton, QSizePolicy, QSlider, QSplitter, QStatusBar,
     QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from config import Config
 from core.batch_export import ExportEntry, export_batch, replay_patches
 from core.dust_remover import DustRemover
+from core.frame_crop import crop_from_edges, crop_plan, detect_frame
 from core.inspection import dust_view, infrared_view
 from core.manual_retouch import covered_candidates, retouch_patch
 from core.repeated_defects import repeated_defects
@@ -30,10 +31,12 @@ from core.scan_detection import detect_brush, detect_scan, refine_candidate
 from core.scan_io import TIFF_EXTENSIONS, Scan, read_ir_plane, read_scan, signature
 from core.workspace_store import WorkspaceStore
 
+from .batch_crop_dialog import BatchCropDialog, CropSuggestion
+from .crop_dialog import CropDialog
 from .dust_panel import DustPanel
 from .export_dialog import ExportDialog
 from .file_panel import FilePanel
-from .image_viewer import RETOUCH_MODES, ImageViewer, defect_path
+from .image_viewer import DEFAULT_CANVAS_BACKGROUND, RETOUCH_MODES, ImageViewer, defect_path
 from .notice_dialog import NoticeDialog
 from .scan_queue import ScanQueueDialog
 from .repeat_dialog import RepeatDialog
@@ -138,6 +141,26 @@ class EditCommand(QUndoCommand):
                                 self.patch, use_after=True, repaired=self.repaired_items() if self.patch else ())
 
 
+class CropCommand(QUndoCommand):
+    patch = None
+
+    def __init__(self, window, settings, revision, *, state=None):
+        super().__init__("取消裁切" if settings is None else "裁切与旋转")
+        self.window = window
+        self.before = window._crop if state is None else state.crop
+        self.after = settings
+        self.old_revision = window._revision if state is None else state.revision
+        self.new_revision = revision
+
+    def undo(self):
+        if not self.window._restoring_workspace:
+            self.window._apply_crop(self.before, self.old_revision)
+
+    def redo(self):
+        if not self.window._restoring_workspace:
+            self.window._apply_crop(self.after, self.new_revision)
+
+
 @dataclass
 class PhotoState:
     stamp: tuple | None
@@ -152,6 +175,7 @@ class PhotoState:
     view: tuple | None = None
     size: tuple | None = None
     repaired_marks: dict = field(default_factory=dict)
+    crop: dict | None = None
 
 
 class MainWindow(QMainWindow):
@@ -175,6 +199,7 @@ class MainWindow(QMainWindow):
         self._photos = {}
         self._applied_patches = []
         self._repaired_marks = {}
+        self._crop = None
         self._infrared = None
         self._ir_source = ""
         self._ir_override = None
@@ -375,6 +400,8 @@ class MainWindow(QMainWindow):
             **{mode or "pointer": button for mode, button in self.edit_buttons.items()},
             "marks": self.btn_marks, "fit": self.btn_fit,
             "zoom-out": self.btn_zoom_out, "zoom-in": self.btn_zoom_in,
+            "crop": self.btn_crop,
+            "batch-crop": self.btn_batch_crop,
         }
         splitter.addWidget(workspace)
 
@@ -427,6 +454,12 @@ class MainWindow(QMainWindow):
             self.edit_group.addButton(button)
             self.edit_buttons[mode] = button
             layout.addWidget(button)
+        self.btn_crop = self._tool("裁切", "裁切扫描边框与微调旋转", self._on_crop)
+        self.btn_crop.setObjectName("canvasToolBtn")
+        layout.addWidget(self.btn_crop)
+        self.btn_batch_crop = self._tool("批量裁切", "统一留边并识别整卷片框", self._on_batch_crop)
+        self.btn_batch_crop.setObjectName("canvasToolBtn")
+        layout.addWidget(self.btn_batch_crop)
         layout.addStretch()
 
         self.retouch_radius = QSpinBox()
@@ -507,6 +540,10 @@ class MainWindow(QMainWindow):
                                ("ignore", "X"), ("repair", "E"), ("clone", "S"), ("spot", "H")):
             button = self.edit_buttons[mode]
             self._button_shortcut(tool_menu, button.accessibleName(), button, shortcut)
+        self._button_shortcut(tool_menu, "裁切与旋转…", self.btn_crop, "C")
+        self._button_shortcut(tool_menu, "批量裁切与旋转…", self.btn_batch_crop, "Ctrl+Shift+C")
+        self.cancel_crop_action = self._action(tool_menu, "取消当前照片裁切",
+                                              lambda: self._cancel_crops((self._current_filepath,)))
         tool_menu.addSeparator()
         self._radius_actions = (
             self._action(tool_menu, "缩小工具半径", lambda: self._step_tool_radius(-1), "["),
@@ -646,7 +683,8 @@ class MainWindow(QMainWindow):
         self.dust_panel.preview_mode_changed.connect(self._refresh_local_preview)
         self.dust_panel.dismiss_clicked.connect(self._delete_dust_item)
         self.image_viewer.annotation_clicked.connect(self._on_annotation_clicked)
-        self.image_viewer.annotation_right_clicked.connect(self._on_annotation_right_clicked)
+        for viewer in (self.image_viewer, self.original_viewer):
+            viewer.canvas_menu_requested.connect(self._show_canvas_menu)
         self.image_viewer.region_selected.connect(self._on_region_selected)
         self.image_viewer.stroke_drawn.connect(self._on_stroke_drawn)
         self.image_viewer.sample_requested.connect(self._sample_retouch)
@@ -726,6 +764,8 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self):
         self.theme_manager.set_theme(self.config.get("theme", "dark"))
+        background = self.config.get("canvas_background")
+        self._set_canvas_background(background if isinstance(background, str) and QColor(background).isValid() else None)
         self.resize(self.config.get("window.width", 1400), self.config.get("window.height", 900))
         for side, panel in self._sidebar_panels.items():
             width = self.config.get(f"sidebars.{side}.width", self._sidebar_widths[side])
@@ -758,9 +798,14 @@ class MainWindow(QMainWindow):
                 history = self._new_history()
                 history.blockSignals(True)
                 for record in state["commands"]:
-                    command = EditCommand(self, record["title"], record["before"], record["after"],
-                                          record["patch"])
-                    for key in ("old_revision", "new_revision", "old_ignored", "new_ignored"):
+                    if record.get("kind") == "crop":
+                        command = CropCommand(self, record["after"], record["new_revision"])
+                        command.before = record["before"]
+                        keys = ("old_revision", "new_revision")
+                    else:
+                        command = EditCommand(self, record["title"], record["before"], record["after"], record["patch"])
+                        keys = ("old_revision", "new_revision", "old_ignored", "new_ignored")
+                    for key in keys:
                         setattr(command, key, record[key])
                     history.push(command)
                     self._next_revision = max(self._next_revision, command.new_revision + 1)
@@ -777,7 +822,7 @@ class MainWindow(QMainWindow):
                     state["candidates"], state["ignored"], state["patches"],
                     state["revision"], state["exported_revision"], state["scan_source"],
                     tuple(state["ir_override"]) if state["ir_override"] else None,
-                    state.get("view"), state.get("size"), dict(repaired),
+                    state.get("view"), state.get("size"), dict(repaired), state.get("crop"),
                 )
         finally:
             self._restoring_workspace = False
@@ -787,6 +832,10 @@ class MainWindow(QMainWindow):
         commands = []
         for index in range(state.history.count()):
             command = state.history.command(index)
+            if isinstance(command, CropCommand):
+                commands.append(dict(kind="crop", title=command.text(), before=command.before, after=command.after,
+                                     old_revision=command.old_revision, new_revision=command.new_revision))
+                continue
             record = {name: getattr(command, name) for name in (
                 "before", "after", "patch", "old_revision", "new_revision", "old_ignored", "new_ignored"
             )}
@@ -798,6 +847,7 @@ class MainWindow(QMainWindow):
             "ir_override": state.ir_override, "view": state.view, "size": state.size,
             "commands": commands, "index": state.history.index(),
             "repaired_marks": list(state.repaired_marks.items()),
+            "crop": state.crop,
         }
 
     def _queue_workspace(self, path=None):
@@ -851,16 +901,19 @@ class MainWindow(QMainWindow):
         for button in self._sidebar_buttons.values():
             button.setEnabled(not busy)
         for control in (self.btn_fit, self.btn_zoom_in, self.btn_zoom_out, self.btn_100,
-                        self.edit_toolbar, self.retouch_toolbar, self.brush_radius, self.btn_marks,
+                        self.edit_toolbar, self.brush_radius, self.btn_marks, self.btn_crop,
+                        self.retouch_radius, self.retouch_hardness, self.retouch_opacity,
+                        self.edit_buttons["clone"], self.edit_buttons["spot"],
                         self.dust_panel.btn_detect):
             control.setEnabled(has_image and not busy)
         for controls, enabled in (
-            ((self.btn_compare, *self._comparison_actions), self._revision != 0),
-            ((self.btn_prev, self.btn_next), has_photos),
+            ((self.btn_compare, *self._comparison_actions), bool(self._applied_patches)),
+            ((self.btn_prev, self.btn_next, self.btn_batch_crop), has_photos),
             ((self.dust_panel.btn_check_visible, self.dust_panel.btn_uncheck_visible), has_image),
             ((self.dust_panel.btn_export, self.export_action, self.ir_action), has_image),
             ((self.remove_photo_action, self.reveal_photo_action), has_image and has_photos),
             ((self.reset_photo_action,), self._can_reset_photo(self._current_filepath)),
+            ((self.cancel_crop_action,), self._has_crop(self._current_filepath)),
             ((self.clear_photos_action, self.file_panel.btn_clear), has_photos),
             ((self.ir_fourth_action,), bool(is_tiff)),
             ((self.batch_export_action, self.batch_scan_action, self.dust_panel.btn_batch_scan),
@@ -902,6 +955,7 @@ class MainWindow(QMainWindow):
             self.overlay.raise_()
             self.overlay.show()
         job.start()
+        return job
 
     def _finish_job(self):
         self.overlay.hide()
@@ -964,12 +1018,16 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         reveal = menu.addAction("打开所在位置")
+        cancel_crop = menu.addAction("取消裁切")
+        cancel_crop.setEnabled(self._has_crop(path))
         reset = menu.addAction("重置照片…")
         reset.setEnabled(self._can_reset_photo(path))
         remove = menu.addAction("从列表移除此照片")
         chosen = menu.exec(photos.viewport().mapToGlobal(position))
         if chosen is reveal:
             self._reveal_photo(path)
+        elif chosen is cancel_crop:
+            self._cancel_crops((path,))
         elif chosen is reset:
             self._reset_photo(path)
         elif chosen is remove:
@@ -1004,7 +1062,7 @@ class MainWindow(QMainWindow):
         name = Path(path).name
         answer = NoticeDialog(
             self, "重置照片",
-            f"将重置 {name} 的扫描和修复。\n撤销历史会清空，原片及已导出的文件会保留。",
+            f"将重置 {name} 的扫描、修复和裁切。\n撤销历史会清空，原片及已导出的文件会保留。",
             confirm="重置照片",
         ).exec()
         if not answer:
@@ -1015,7 +1073,7 @@ class MainWindow(QMainWindow):
         state = self._photos[path]
         state.history.clear()
         reset = replace(state, candidates=[], ignored=[], patches=[], repaired_marks={},
-                        revision=0, exported_revision=0, scan_source="")
+                        revision=0, exported_revision=0, scan_source="", crop=None)
         if active:
             scan = Scan(self._original_image, self._infrared, self._ir_source)
             self._show_photo(path, scan.image, scan=scan, stamp=state.stamp, restored=reset)
@@ -1068,6 +1126,7 @@ class MainWindow(QMainWindow):
         self._history = self._new_history()
         self._applied_patches = []
         self._repaired_marks = {}
+        self._crop = None
         self._dust_items = []
         self._ignored_items = []
         self.btn_compare.setChecked(False)
@@ -1166,6 +1225,7 @@ class MainWindow(QMainWindow):
             self._scan_source, self._ir_override,
             self.image_viewer.view_position(), self.image_viewer.get_image_size(),
             self._repaired_marks,
+            self._crop,
         )
         self._photos[self._current_filepath] = state
         if schedule:
@@ -1176,10 +1236,11 @@ class MainWindow(QMainWindow):
         if state.scan_source or state.candidates or state.revision:
             count = len(state.candidates)
             checked = sum(item.selected for item in state.candidates)
-            source = state.scan_source or "手动编辑"
+            source = state.scan_source or ("手动编辑" if state.patches else "未扫描")
+            crop = " · 已裁切" if state.crop is not None else ""
             self.file_panel.set_photo_status(
-                path, f"{source} · {count} 个候选 · 已勾选 {checked}", count,
-                scanned=bool(state.scan_source), repaired=bool(state.revision),
+                path, f"{source} · {count} 个候选 · 已勾选 {checked}{crop}", count,
+                scanned=bool(state.scan_source), repaired=bool(state.patches),
             )
         else:
             self.file_panel.set_photo_status(path, "未扫描", None)
@@ -1207,12 +1268,15 @@ class MainWindow(QMainWindow):
         self._ignored_items = restored.ignored if restored else []
         self._applied_patches = restored.patches if restored else []
         self._repaired_marks = restored.repaired_marks if restored else {}
+        self._crop = restored.crop if restored else None
         self._scan_source = restored.scan_source if restored else ""
         self._ir_override = restored.ir_override if restored else None
         self.btn_compare.setChecked(False)
         self._toggle_comparison(False)
         self.edit_buttons[None].setChecked(True)
         self.image_viewer.load_image(image)
+        if self._crop is not None:
+            self.image_viewer.set_geometry(self._crop)
         self.dust_panel.set_infrared_available(self._infrared is not None)
         if self.dust_panel.inspection_layer() != "rgb" or self.dust_panel.btn_dust_view.isChecked():
             self._update_inspection_view()
@@ -1239,6 +1303,9 @@ class MainWindow(QMainWindow):
 
     def _update_image_info(self, w, h):
         source = " · IR" if self._infrared is not None else ""
+        if self._crop is not None:
+            _, _, (w, h), _ = crop_plan((h, w), self._crop)
+            source += " · 已裁切"
         self.lbl_status_info.setText(f"{w:,} × {h:,} px{source}")
         self.lbl_status_info.setToolTip(self._ir_source)
 
@@ -1373,6 +1440,7 @@ class MainWindow(QMainWindow):
             self.view_layout.activate()
             if not self.original_viewer.get_image_size()[0]:
                 self.original_viewer.load_image(self._original_image)
+            self.original_viewer.set_geometry(self._crop, fit=False)
             self.original_viewer.match_view(self.image_viewer)
         else:
             self.original_viewer.clear_image()
@@ -1546,6 +1614,157 @@ class MainWindow(QMainWindow):
 
     def _on_detect_dust(self):
         self._start_detection()
+
+    def _on_crop(self):
+        if self._current_image is None or self._job is not None:
+            return
+        dialog = CropDialog(self._current_image, self._crop, self, background=self.config.get("canvas_background"))
+        accepted = dialog.exec() == CropDialog.Accepted
+        settings = dialog.settings()
+        dialog.deleteLater()
+        if not accepted:
+            return
+        if settings is None:
+            self._cancel_crops((self._current_filepath,))
+        elif self._record_crop(self._current_filepath, settings):
+            self.lbl_status_file.setText("已更新裁切 · 可撤销")
+
+    def _has_crop(self, path):
+        if path == self._current_filepath:
+            return self._crop is not None
+        state = self._photos.get(path)
+        return state is not None and state.crop is not None
+
+    def _cancel_crops(self, paths):
+        if self._job is not None:
+            return
+        count = sum(self._record_crop(path, None) for path in paths if self._has_crop(path))
+        if count:
+            self.lbl_status_file.setText(f"已取消 {count} 张裁切 · 可逐张撤销")
+
+    def _record_crop(self, path, settings):
+        state = None if path == self._current_filepath else self._photos[path]
+        if settings == (self._crop if state is None else state.crop):
+            return False
+        revision = self._next_revision
+        self._next_revision += 1
+        command = CropCommand(self, settings, revision, state=state)
+        if state is None:
+            self._history.push(command)
+        else:
+            self._restoring_workspace = True
+            try:
+                state.history.push(command)
+            finally:
+                self._restoring_workspace = False
+            state.crop, state.revision, state.view = settings, revision, None
+            self._update_file_status(path, state)
+            self._queue_workspace(path)
+        return True
+
+    def _on_batch_crop(self):
+        paths = self.file_panel.photo_paths()
+        if self._job is not None or not paths:
+            return
+        self._stash_current()
+        dialog = BatchCropDialog(paths, {path for path in paths if self._has_crop(path)},
+                                 self._read_batch_crop, self, background=self.config.get("canvas_background"))
+        action = dialog.exec()
+        if action != BatchCropDialog.Accepted:
+            if action == BatchCropDialog.ResetCrops:
+                self._cancel_crops(dialog.reset_selection())
+            dialog.deleteLater()
+            return
+        selected = dialog.selection()
+        aspect = dialog.aspect.currentData()
+        known_stamps = {path: self._photos[path].stamp for path in selected if path in self._photos}
+        cancel = self._export_cancel = Event()
+        results = []
+
+        def work(progress):
+            suggestions = []
+            for index, path in enumerate(selected):
+                if cancel.is_set():
+                    break
+                progress(f"正在识别片框 · {Path(path).name}", index, len(selected))
+                try:
+                    stamp = signature(path)
+                    if known_stamps.get(path) not in (None, stamp):
+                        raise ValueError("原图已变化，请重新打开照片")
+                    image = read_scan(path, read_ir=False).image
+                    if signature(path) != stamp:
+                        raise ValueError("读取期间原图发生变化")
+                    detected = detect_frame(image)
+                    corners = detected["corners"] if detected else None
+                    crop_plan(image.shape, crop_from_edges(image.shape, corners, aspect=aspect))
+                    suggestions.append(CropSuggestion(path, stamp, image.shape[1::-1], detected))
+                except (OSError, ValueError, cv2.error) as error:
+                    suggestions.append(CropSuggestion(path, error=str(error)))
+                progress(f"已检查 {index + 1}/{len(selected)} 张片框", index + 1, len(selected))
+            return suggestions
+
+        def review_results():
+            try:
+                if cancel.is_set():
+                    self.lbl_status_file.setText(f"已停止片框识别 · 已检查 {len(results)} 张")
+                if results:
+                    dialog.set_results(results)
+                    if dialog.exec() == BatchCropDialog.Accepted:
+                        self._apply_batch_crops(dialog.approved())
+            finally:
+                dialog.deleteLater()
+
+        job = self._start_job("正在准备批量识别片框…", work, results.extend, cancel_label="停止识别")
+        job.finished.connect(review_results)
+
+    def _read_batch_crop(self, result):
+        try:
+            if signature(result.path) != result.stamp:
+                raise ValueError("原图已变化，请重新打开后识别")
+            image = read_scan(result.path, read_ir=False).image
+            if signature(result.path) != result.stamp:
+                raise ValueError("读取期间原图发生变化")
+        except (OSError, ValueError, cv2.error) as error:
+            NoticeDialog(QApplication.activeModalWidget() or self, "无法核对裁切",
+                         str(error), warning=True).exec()
+            return None
+        return image
+
+    def _apply_batch_crops(self, approved):
+        applied, unchanged, errors = 0, 0, []
+        for result, settings in approved:
+            path = result.path
+            try:
+                if signature(path) != result.stamp:
+                    raise ValueError("原图已变化，请重新打开后识别")
+            except (OSError, ValueError) as error:
+                errors.append(f"{Path(path).name} · {error}")
+                continue
+            if path != self._current_filepath and path not in self._photos:
+                self._photos[path] = PhotoState(result.stamp, self._new_history(), [], [], [], 0, 0, "",
+                                                None, size=result.size)
+            if self._record_crop(path, settings):
+                applied += 1
+            else:
+                unchanged += 1
+        status = f"已应用 {applied} 张裁切 · 可逐张撤销"
+        if unchanged:
+            status += f" · {unchanged} 张设置相同"
+        if errors:
+            status += f" · {len(errors)} 张未应用"
+            NoticeDialog(self, "批量裁切结果", status, warning=True, details="\n".join(errors)).exec()
+        self.lbl_status_file.setText(status)
+
+    def _apply_crop(self, settings, revision):
+        self.btn_compare.setChecked(False)
+        self._toggle_comparison(False)
+        self.edit_buttons[None].setChecked(True)
+        self._crop, self._revision = settings, revision
+        self.image_viewer.set_geometry(settings)
+        h, w = self._current_image.shape[:2]
+        self._update_image_info(w, h)
+        self._stash_current()
+        self._refresh_controls()
 
     def _on_region_selected(self, x1, y1, x2, y2, additive=False):
         if self._job is not None:
@@ -1838,12 +2057,41 @@ class MainWindow(QMainWindow):
         self._pinned_candidate = dust_id
         self._on_dust_hovered(dust_id)
 
-    def _on_annotation_right_clicked(self, dust_id, position):
+    def _set_canvas_background(self, color):
+        for viewer in (self.image_viewer, self.original_viewer):
+            viewer.set_canvas_background(color)
+        self.config.set("canvas_background", color)
+
+    def _show_canvas_menu(self, dust_id, position):
         menu = QMenu(self)
-        repair = menu.addAction("修复此项")
-        dismiss = menu.addAction("忽略此项")
+        repair = dismiss = None
+        if dust_id is not None:
+            repair = menu.addAction("修复此项")
+            dismiss = menu.addAction("忽略此项")
+            menu.addSeparator()
+        background = menu.addMenu("画布背景")
+        current = self.config.get("canvas_background")
+        presets = {}
+        for label, color in (("默认", None), ("深灰", "#333333"), ("中灰", "#808080"),
+                             ("黑色", "#000000"), ("白色", "#ffffff")):
+            option = background.addAction(label)
+            option.setCheckable(True)
+            option.setChecked(current == color)
+            presets[option] = color
+        background.addSeparator()
+        custom = background.addAction("自定义颜色…")
         action = menu.exec(position)
-        if action is repair:
+        if action is None:
+            return
+        if action in presets:
+            self._set_canvas_background(presets[action])
+            self.config.save()
+        elif action is custom:
+            color = QColorDialog.getColor(QColor(current or DEFAULT_CANVAS_BACKGROUND), self, "画布背景色")
+            if color.isValid():
+                self._set_canvas_background(color.name())
+                self.config.save()
+        elif action is repair:
             self._repair_single_dust(dust_id)
         elif action is dismiss:
             self._delete_dust_item(dust_id)
@@ -1992,7 +2240,7 @@ class MainWindow(QMainWindow):
                 self._current_image.reshape(-1, 3)[positions] = after if use_after else before
             self._update_inspection_view()
         self._revision = revision
-        if revision == 0 and self.btn_compare.isChecked():
+        if not self._applied_patches and self.btn_compare.isChecked():
             self.btn_compare.setChecked(False)
             self._toggle_comparison(False)
         self._dust_items = [replace(item) for item in items]
@@ -2032,8 +2280,10 @@ class MainWindow(QMainWindow):
             has_work = bool(checked or edited)
             status = (f"{checked} 项已勾选" if state and (state.scan_source or state.candidates)
                       else "未扫描")
-            if edited:
+            if state and state.patches:
                 status += " · 已有修复"
+            if state and state.crop is not None:
+                status += " · 已裁切"
             rows.append((path, has_work, status))
         if not rows:
             return
@@ -2058,6 +2308,7 @@ class MainWindow(QMainWindow):
                 tuple(item for item in state.candidates if item.selected) if state else (),
                 state.revision if state else 0,
                 tuple(state.candidates) if state and include_review else (),
+                state.crop if state else None,
             ))
         cancel = self._export_cancel = Event()
         repair_params = self.dust_panel.get_inpaint_params()

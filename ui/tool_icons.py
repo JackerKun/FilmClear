@@ -7,6 +7,8 @@ from PySide6.QtSvg import QSvgRenderer
 
 _MARQUEE = '<rect x="3" y="3" width="14" height="14" rx="2" stroke-dasharray="2.5 2.5"/>'
 _SHAPES = {
+    "crop": '<path d="M5 2v11a2 2 0 0 0 2 2h11M2 5h11a2 2 0 0 1 2 2v11M4 16 16 4"/>',
+    "batch-crop": '<path d="M3 2v10a2 2 0 0 0 2 2h12M1.5 5h10a2 2 0 0 1 2 2v11M7 17h11M17 8v6"/>',
     "sidebar-left": '<rect x="2.5" y="4" width="15" height="12" rx="2"/><path d="M7.5 4v12"/>',
     "sidebar-right": '<rect x="2.5" y="4" width="15" height="12" rx="2"/><path d="M12.5 4v12"/>',
     "chevron-left": '<path d="m12 5-5 5 5 5"/>',

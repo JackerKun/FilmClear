@@ -10,6 +10,7 @@ import cv2
 
 from .dust_remover import DustRemover
 from .export_metadata import read_metadata, write_repaired
+from .frame_crop import apply_crop
 from .scan_io import read_scan, signature
 
 SOURCE_FORMAT = "source"
@@ -22,6 +23,7 @@ class ExportEntry:
     selected: tuple
     revision: int = 0
     candidates: tuple = ()
+    crop: dict | None = None
 
 
 def replay_patches(original, patches):
@@ -53,7 +55,9 @@ def _write_entry(entry, directory, extension, mode, repair_params):
                 image = replay_patches(scan.image, entry.patches)
                 if mode == "repair" and entry.selected:
                     image = DustRemover(**repair_params).remove(image, entry.selected, selected_only=False)
-                write_repaired(output, image, suffix.lower(), read_metadata(source))
+                image = apply_crop(image, entry.crop)
+                write_repaired(output, image, suffix.lower(), read_metadata(source),
+                               geometry_changed=entry.crop is not None)
             output.close()
             return publish_file(temporary, directory, base, suffix)
         finally:
