@@ -38,6 +38,7 @@ from .export_dialog import ExportDialog
 from .file_panel import FilePanel
 from .image_viewer import DEFAULT_CANVAS_BACKGROUND, RETOUCH_MODES, ImageViewer, defect_path
 from .notice_dialog import NoticeDialog
+from .numeric_fields import use_standard_digits
 from .scan_queue import ScanQueueDialog
 from .repeat_dialog import RepeatDialog
 from .theme_manager import ThemeManager
@@ -366,6 +367,7 @@ class MainWindow(QMainWindow):
         self.edit_buttons[None].setChecked(True)
 
         self.brush_radius = QSpinBox()
+        use_standard_digits(self.brush_radius)
         self.brush_radius.setRange(4, 48)
         self.brush_radius.setValue(self.image_viewer.brush_radius)
         self.brush_radius.setFixedWidth(48)
@@ -470,6 +472,7 @@ class MainWindow(QMainWindow):
             (self.retouch_hardness, "硬度", "降低硬度可让笔刷边缘渐变", (0, 100), 70, "%"),
             (self.retouch_opacity, "不透明度", "降低不透明度可保留部分原图", (1, 100), 100, "%"),
         ):
+            use_standard_digits(spin)
             spin.setRange(*limits)
             spin.setValue(value)
             spin.setPrefix(title + " ")

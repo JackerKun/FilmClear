@@ -10,9 +10,9 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, QTimer, Qt
+from PySide6.QtCore import QLocale, QPoint, QPointF, QTimer, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QMenu, QTreeWidget
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QDialog, QMenu, QTreeWidget
 
 from config import Config
 from core.frame_crop import apply_crop, crop_plan
@@ -26,6 +26,33 @@ from ui.notice_dialog import NoticeDialog
 
 
 class WorkspaceTest(unittest.TestCase):
+    def test_numeric_parameters_use_standard_digits_in_chinese_hong_kong_and_macau(self):
+        app = QApplication.instance() or QApplication([])
+        self.addCleanup(QLocale.setDefault, QLocale())
+        for name in ("zh-Hans-HK", "zh-Hans-MO"):
+            with self.subTest(locale=name), tempfile.TemporaryDirectory() as directory, \
+                    patch("ui.main_window.Config", lambda: Config(directory)):
+                QLocale.setDefault(QLocale(name))
+                window = MainWindow()
+                crop = CropDialog(np.zeros((100, 180, 3), np.uint8), None, window)
+                try:
+                    fields = window.findChildren(QAbstractSpinBox)
+                    self.assertIn(crop.rotation, fields)
+                    self.assertIn(crop.border, fields)
+                    for field in fields:
+                        self.assertEqual(field.locale().name(), "C")
+                    radius = window.dust_panel.spin_inpaint_radius
+                    self.assertEqual(radius.cleanText(), "3")
+                    radius.stepUp()
+                    self.assertEqual(radius.cleanText(), "4")
+                    crop.border.lineEdit().setText(f"{crop.border.prefix()}2.5{crop.border.suffix()}")
+                    crop.border.interpretText()
+                    self.assertEqual(crop.border.value(), 2.5)
+                    self.assertEqual(QLocale().name(), QLocale(name).name())
+                finally:
+                    crop.close()
+                    window.close()
+
     def test_batch_crop_can_apply_only_confirmed_frames_and_reset_selected_crops(self):
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):

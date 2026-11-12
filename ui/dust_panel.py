@@ -15,6 +15,7 @@ from core.dust_remover import DustRemover
 from core.scan_io import display_pixels
 
 from .image_viewer import photo_pixmap
+from .numeric_fields import use_standard_digits
 
 
 class InspectionComboBox(QComboBox):
@@ -343,6 +344,7 @@ class DustPanel(QWidget):
         self.combo_method.currentIndexChanged.connect(self.preview_mode_changed)
         repair.addWidget(self.combo_method, 1)
         self.spin_inpaint_radius = QSpinBox()
+        use_standard_digits(self.spin_inpaint_radius)
         self.spin_inpaint_radius.setRange(1, 20)
         self.spin_inpaint_radius.setValue(3)
         self.spin_inpaint_radius.setPrefix("半径  ")

@@ -15,6 +15,7 @@ from core.frame_crop import (
     frame_points, rectangular_settings, rotation_matrix,
 )
 from .image_viewer import ImageViewer, photo_pixmap
+from .numeric_fields import use_standard_digits
 
 
 class FrameEditor(ImageViewer):
@@ -242,6 +243,7 @@ class CropDialog(QDialog):
         controls.addWidget(QLabel("画幅"))
         controls.addWidget(self.aspect)
         self.rotation = QDoubleSpinBox()
+        use_standard_digits(self.rotation)
         self.rotation.setRange(-15, 15)
         self.rotation.setDecimals(2)
         self.rotation.setSingleStep(0.1)
@@ -422,6 +424,7 @@ def aspect_control():
 
 def border_control():
     border = QDoubleSpinBox()
+    use_standard_digits(border)
     border.setRange(0, 10)
     border.setSingleStep(0.1)
     border.setDecimals(1)
