@@ -43,6 +43,7 @@ from .scan_queue import ScanQueueDialog
 from .repeat_dialog import RepeatDialog
 from .theme_manager import ThemeManager
 from .tool_icons import tool_icon
+from .update_checker import GITHUB_PROJECT, UpdateChecker
 
 
 class WorkspaceJob(QThread):
@@ -219,6 +220,9 @@ class MainWindow(QMainWindow):
         self._syncing_comparison = False
         self._compare_leader = None
         self._history = self._new_history()
+        self._manual_update_check = False
+        self._update_checker = UpdateChecker(QApplication.applicationVersion(), self)
+        self._update_checker.check_finished.connect(self._finish_update_check)
 
         self.setWindowTitle("FilmClear — 胶片工作台")
         self.setMinimumSize(1040, 680)
@@ -284,6 +288,25 @@ class MainWindow(QMainWindow):
             header.addWidget(control)
         header.addWidget(self._sidebar_header_buttons["right"])
         canvas.addLayout(header)
+
+        self._update_banner = QFrame()
+        self._update_banner.setObjectName("canvasTools")
+        update_layout = QHBoxLayout(self._update_banner)
+        update_layout.setContentsMargins(10, 4, 4, 4)
+        self._update_label = QLabel()
+        self._update_label.setTextFormat(Qt.PlainText)
+        update_layout.addWidget(self._update_label, 1)
+        self._update_release_page = QUrl()
+        download = QPushButton("去下载")
+        download.setToolTip("在浏览器打开 GitHub 发布页")
+        download.clicked.connect(lambda: QDesktopServices.openUrl(self._update_release_page))
+        update_layout.addWidget(download)
+        dismiss = QPushButton("稍后")
+        dismiss.setObjectName("secondaryBtn")
+        dismiss.clicked.connect(self._update_banner.hide)
+        update_layout.addWidget(dismiss)
+        self._update_banner.hide()
+        canvas.addWidget(self._update_banner)
 
         self.image_viewer = ImageViewer()
         self.original_viewer = ImageViewer()
@@ -434,6 +457,31 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.lbl_status_info)
         status.addPermanentWidget(self.lbl_status_dust)
 
+    def check_for_updates(self, *, manual=False):
+        if manual:
+            self._manual_update_check = True
+            self._check_update_action.setEnabled(False)
+            self.statusBar().showMessage("正在检查更新…")
+        self._update_checker.check()
+
+    def _finish_update_check(self, tag, release_page):
+        if not release_page.isEmpty():
+            self._update_label.setText(f"FilmClear {tag} 已发布")
+            self._update_release_page = release_page
+            self._update_banner.show()
+        elif tag:
+            self._update_banner.hide()
+        if self._manual_update_check:
+            self._manual_update_check = False
+            self._check_update_action.setEnabled(True)
+            if not release_page.isEmpty():
+                message = f"发现新版本 {tag}"
+            elif tag:
+                message = f"当前版本 {QApplication.applicationVersion()}，暂无可用更新"
+            else:
+                message = "暂时无法检查更新，请稍后重试"
+            self.statusBar().showMessage(message, 7000)
+
     def _setup_retouch_toolbar(self):
         toolbar = QFrame()
         toolbar.setObjectName("canvasTools")
@@ -576,6 +624,10 @@ class MainWindow(QMainWindow):
 
         help_menu = self.menuBar().addMenu("说明")
         self._action(help_menu, "键盘快捷键…", self._show_shortcuts, "F1")
+        help_menu.addSeparator()
+        self._check_update_action = self._action(help_menu, "检查更新",
+                                                 lambda: self.check_for_updates(manual=True))
+        self._action(help_menu, "打开 GitHub", lambda: QDesktopServices.openUrl(QUrl(GITHUB_PROJECT)))
         self._shortcut_menus = (file_menu, edit_menu, tool_menu, view_menu, help_menu)
 
     def _show_shortcuts(self):
