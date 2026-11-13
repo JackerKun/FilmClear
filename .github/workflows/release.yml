@@ -69,7 +69,7 @@ jobs:
         shell: bash
         env:
           FILMCLEAR_EXECUTABLE: ${{ matrix.entrypoint }}
-          QT_QPA_PLATFORM: offscreen
+          QT_QPA_PLATFORM: ${{ runner.os == 'Windows' && 'windows' || 'offscreen' }}
         run: |
           python - <<'PY'
           import os
@@ -78,13 +78,23 @@ jobs:
           from tempfile import TemporaryDirectory
 
           exe = Path(os.environ["FILMCLEAR_EXECUTABLE"]).resolve(strict=True)
-          with TemporaryDirectory() as workdir, Popen([str(exe)], cwd=workdir) as app:
-              try:
-                  status = app.wait(timeout=8)
-              except TimeoutExpired:
-                  app.terminate()
-              else:
-                  raise SystemExit(f"FilmClear exited during startup with status {status}")
+          with TemporaryDirectory() as workdir:
+              env = dict(os.environ, TMPDIR=workdir, TEMP=workdir, TMP=workdir)
+              log = Path(workdir) / "FilmClear-startup.log"
+              with Popen([str(exe)], cwd=workdir, env=env) as app:
+                  try:
+                      status = app.wait(timeout=18)
+                  except TimeoutExpired:
+                      app.terminate()
+                  else:
+                      if log.is_file():
+                          print(log.read_text(encoding="utf-8", errors="replace"))
+                      raise SystemExit(f"FilmClear exited during startup with status {status}")
+              if os.name == "nt":
+                  startup = log.read_text(encoding="utf-8", errors="replace")
+                  print(startup)
+                  if "Main window shown" not in startup or "Release check worker exited:" not in startup:
+                      raise SystemExit("FilmClear did not finish the Windows startup check")
           PY
 
       - name: Archive macOS app

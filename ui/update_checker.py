@@ -1,34 +1,17 @@
-"""Check the latest public FilmClear release without blocking the workspace."""
+"""Run the release check outside the GUI process."""
 
-import json
-import re
+import logging
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtCore import QObject, QProcess, QTimer, QUrl, Signal
 
-
-REPOSITORY = "JackerKun/FilmClear"
-GITHUB_PROJECT = f"https://github.com/{REPOSITORY}"
-RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
-RELEASE_PAGE = f"{GITHUB_PROJECT}/releases/tag/"
-TIMEOUT_MS = 10000
-VERSION_PATTERN = re.compile(r"v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})")
+from release_check import RELEASE_PAGE, WORKER_FLAG, version
 
 
-def _version(text):
-    match = VERSION_PATTERN.fullmatch(text) if isinstance(text, str) else None
-    return tuple(map(int, match.groups())) if match else None
-
-
-def _published_release_tag(body):
-    try:
-        release = json.loads(body)
-    except ValueError:
-        return None
-    if not isinstance(release, dict) or release.get("draft") is not False or release.get("prerelease") is not False:
-        return None
-    tag = release.get("tag_name")
-    return tag if _version(tag) is not None else None
+TIMEOUT_MS = 12000
+LOG = logging.getLogger(__name__)
 
 
 class UpdateChecker(QObject):
@@ -37,31 +20,66 @@ class UpdateChecker(QObject):
 
     def __init__(self, current_version, parent=None):
         super().__init__(parent)
-        self._current_version = _version(current_version)
-        self._reply = None
-        self._network = QNetworkAccessManager(self)
-        self._network.finished.connect(self._finish)
+        self._current_version = version(current_version)
+        self._result_dir = None
+        self._process = QProcess(self)
+        self._process.finished.connect(self._finish)
+        self._process.errorOccurred.connect(self._process_error)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._timeout)
+
+    @staticmethod
+    def _worker_arguments(result_file):
+        arguments = [WORKER_FLAG, str(result_file)]
+        if not getattr(sys, "frozen", False):
+            arguments.insert(0, str(Path(__file__).resolve().parents[1] / "main.py"))
+        return arguments
 
     def check(self):
-        if self._reply is not None:
+        if self._result_dir is not None:
             return
-        request = QNetworkRequest(QUrl(RELEASE_API))
-        request.setRawHeader(b"Accept", b"application/vnd.github+json")
-        request.setRawHeader(b"User-Agent", b"FilmClear")
-        request.setAttribute(QNetworkRequest.RedirectPolicyAttribute, QNetworkRequest.SameOriginRedirectPolicy)
-        reply = self._reply = self._network.get(request)
-        timeout = QTimer(reply)
-        timeout.setSingleShot(True)
-        timeout.timeout.connect(reply.abort)
-        reply.finished.connect(timeout.stop)
-        timeout.start(TIMEOUT_MS)
+        try:
+            self._result_dir = TemporaryDirectory(prefix="filmclear-update-", ignore_cleanup_errors=True)
+        except OSError:
+            LOG.exception("Could not create a release check result directory")
+            self.check_finished.emit("", QUrl())
+            return
+        LOG.info("Starting release check worker")
+        self._timer.start(TIMEOUT_MS)
+        result_file = Path(self._result_dir.name) / "tag"
+        self._process.start(sys.executable, self._worker_arguments(result_file))
 
-    def _finish(self, reply):
-        self._reply = None
+    def _timeout(self):
+        LOG.warning("Release check worker timed out")
+        self._process.kill()
+
+    def _process_error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            LOG.warning("Could not start release check worker: %s", self._process.errorString())
+            self._finish(-1, QProcess.ExitStatus.CrashExit)
+
+    def _finish(self, exit_code, exit_status):
+        if self._result_dir is None:
+            return
+        self._timer.stop()
+        directory, self._result_dir = self._result_dir, None
         tag, page = "", QUrl()
-        if reply.error() == QNetworkReply.NoError and self._current_version is not None:
-            tag = _published_release_tag(bytes(reply.readAll())) or ""
-            if tag and _version(tag) > self._current_version:
-                page = QUrl(RELEASE_PAGE + tag)
-        reply.deleteLater()
+        LOG.info("Release check worker exited: %s (%s)", exit_code, exit_status.name)
+        with directory:
+            if exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0 and self._current_version:
+                try:
+                    candidate = (Path(directory.name) / "tag").read_text(encoding="ascii")
+                except (OSError, UnicodeError):
+                    candidate = ""
+                candidate_version = version(candidate)
+                if candidate_version is not None:
+                    tag = candidate
+                    if candidate_version > self._current_version:
+                        page = QUrl(RELEASE_PAGE + tag)
         self.check_finished.emit(tag, page)
+
+    def stop(self):
+        if self._result_dir is not None:
+            self._process.kill()
+            self._process.waitForFinished(1000)

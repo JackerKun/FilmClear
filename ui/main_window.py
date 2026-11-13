@@ -1,6 +1,7 @@
 """FilmClear workspace and non-destructive editing session."""
 
 from dataclasses import dataclass, field, replace
+import logging
 from math import ceil
 from pathlib import Path
 import sqlite3
@@ -30,6 +31,7 @@ from core.review_report import create_review_report
 from core.scan_detection import detect_brush, detect_scan, refine_candidate
 from core.scan_io import TIFF_EXTENSIONS, Scan, read_ir_plane, read_scan, signature
 from core.workspace_store import WorkspaceStore
+from release_check import GITHUB_PROJECT
 
 from .batch_crop_dialog import BatchCropDialog, CropSuggestion
 from .crop_dialog import CropDialog
@@ -43,7 +45,7 @@ from .scan_queue import ScanQueueDialog
 from .repeat_dialog import RepeatDialog
 from .theme_manager import ThemeManager
 from .tool_icons import tool_icon
-from .update_checker import GITHUB_PROJECT, UpdateChecker
+from .update_checker import UpdateChecker
 
 
 class WorkspaceJob(QThread):
@@ -181,7 +183,7 @@ class PhotoState:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, *, restore_workspace=True):
         super().__init__()
         self.config = Config()
         self._workspace = WorkspaceStore(self.config.config_path)
@@ -231,7 +233,7 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._setup_loading()
         self._connect_signals()
-        self._load_settings()
+        self._load_settings(restore_workspace=restore_workspace)
         self._refresh_controls()
 
     @staticmethod
@@ -817,7 +819,7 @@ class MainWindow(QMainWindow):
         history.canRedoChanged.connect(self._refresh_controls)
         return history
 
-    def _load_settings(self):
+    def _load_settings(self, *, restore_workspace):
         self.theme_manager.set_theme(self.config.get("theme", "dark"))
         background = self.config.get("canvas_background")
         self._set_canvas_background(background if isinstance(background, str) and QColor(background).isValid() else None)
@@ -828,6 +830,7 @@ class MainWindow(QMainWindow):
                 self._sidebar_widths[side] = min(panel.maximumWidth(), max(panel.minimumWidth(), width))
             self._sidebar_buttons[side].setChecked(not self.config.get(f"sidebars.{side}.collapsed", False))
         self._layout_sidebars()
+        logging.info("Reading workspace state")
         try:
             manifest, snapshots = self._workspace.load()
             self._restore_workspace_states(snapshots)
@@ -837,14 +840,21 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError, TypeError, BadZipFile, sqlite3.Error) as error:
             self.lbl_status_file.setText(f"工作区恢复失败 · {error}")
             manifest = {}
+        if not restore_workspace:
+            self.lbl_status_file.setText("安全启动 · 已跳过自动打开照片和检查更新")
+            return
         if "paths" in manifest:
             if manifest["paths"]:
                 self._resume_path = manifest.get("active")
-                QTimer.singleShot(0, lambda: self.file_panel.load_files(manifest["paths"], keep_missing=True))
+                QTimer.singleShot(0, lambda: self._reopen_workspace_photos(manifest["paths"]))
             return
         last = self.config.get("last_directory", "")
         if last and Path(last).is_dir():
             QTimer.singleShot(0, lambda: self._load_directory(last))
+
+    def _reopen_workspace_photos(self, paths):
+        logging.info("Reopening the workspace photo list (%s entries)", len(paths))
+        self.file_panel.load_files(paths, keep_missing=True)
 
     def _restore_workspace_states(self, snapshots):
         self._restoring_workspace = True
@@ -1199,6 +1209,7 @@ class MainWindow(QMainWindow):
 
     def _load_directory(self, directory):
         if self._job is None:
+            logging.info("Opening a photo directory")
             try:
                 self.file_panel.load_directory(directory)
             except OSError as error:
@@ -1212,6 +1223,7 @@ class MainWindow(QMainWindow):
                                  confirm="放弃本次修改", cancel="继续编辑").exec())
 
     def _on_directory_loaded(self, files):
+        logging.info("Photo list loaded (%s entries)", len(files))
         if self._current_filepath and self._current_filepath not in self.file_panel.photo_paths():
             self._clear_current_photo()
         self._queue_workspace()
@@ -1243,12 +1255,14 @@ class MainWindow(QMainWindow):
 
     def _load_photo(self, path):
         state = self._photos.get(path)
+        logging.info("Starting photo decode (%s)", Path(path).suffix.lower())
 
         def failed(message):
             self.file_panel.select_file(self._current_filepath, quiet=True)
             self._show_error(f"无法导入 {Path(path).name}\n{message}")
 
         def loaded(result):
+            logging.info("Photo decode complete")
             scan, image, stamp, restored = result
             self._show_photo(path, image, scan=scan, stamp=stamp, restored=restored)
 
@@ -2452,5 +2466,6 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._stop_workers()
+        self._update_checker.stop()
         self._save_settings()
         event.accept()

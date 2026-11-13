@@ -18,7 +18,11 @@
 
 Windows 和 Linux 请保留整个解压目录。macOS 构建使用临时签名，跨机器下载时系统可能要求确认。Linux 需要图形桌面及其 Qt 系统库。
 
+Windows 版要求 **Windows 10 1809（内部版本 17763）或更新的 64 位系统**。Windows 10 企业版 2016 LTSB（1607）缺少 Qt 依赖的 Windows 系统组件，会在加载 `QtWidgets` 时退出。按 `Win + R` 输入 `winver` 可查看系统版本。系统版本符合要求但仍报 DLL 错误时，请先确认 ZIP 已完整解压。
+
 FilmClear 启动后会在后台检查 GitHub 上的最新正式版本。也可通过「说明 → 检查更新」手动查询，或通过「说明 → 打开 GitHub」进入项目主页。发现新版时，点击「去下载」可打开发布页，自行选择下载和安装。离线或检查失败时仍可照常使用。
+
+Windows 启动异常时，可在资源管理器地址栏打开 `%TEMP%\FilmClear-startup.log` 查看最近一次启动记录。也可以在程序所在目录运行 `FilmClear.exe --safe-mode`，跳过自动打开上次的照片和自动检查更新。
 
 ## 快速上手
 
@@ -131,4 +135,4 @@ py -3 -m venv .venv
 
 ## 模型与素材
 
-「主体优先」使用 YuNet 定位人脸，缺陷轮廓由原图检测生成。模型权重来自 [OpenCV Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)，随附 [MIT 许可证](models/YuNet-LICENSE.txt)。应用图标的矢量源文件位于 [assets/filmclear.svg](assets/filmclear.svg)。
+「主体优先」使用随软件打包的 YuNet 模型定位人脸。模型不可用时，仍会按画面纹理离线扫描缺陷。模型权重来自 [OpenCV Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)，随附 [MIT 许可证](models/YuNet-LICENSE.txt)。应用图标的矢量源文件位于 [assets/filmclear.svg](assets/filmclear.svg)。

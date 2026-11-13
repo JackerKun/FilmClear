@@ -1,5 +1,6 @@
 """Local face and texture context for prioritizing visible film defects."""
 
+import logging
 from pathlib import Path
 
 import cv2
@@ -8,6 +9,7 @@ import numpy as np
 from .scan_io import display_pixels
 
 _MODELS = Path(__file__).resolve().parents[1] / "models"
+LOG = logging.getLogger(__name__)
 
 
 def _detect_faces(pixels):
@@ -20,7 +22,11 @@ def _detect_faces(pixels):
     model = _MODELS / name
     if model.is_file() and hasattr(cv2, "FaceDetectorYN_create"):
         try:
-            detector = cv2.FaceDetectorYN_create(str(model), "", (w, h), 0.86)
+            if version >= (4, 14):
+                # Loading bytes also handles Windows paths containing non-ASCII characters.
+                detector = cv2.FaceDetectorYN_create("onnx", model.read_bytes(), b"", (w, h), 0.86)
+            else:
+                detector = cv2.FaceDetectorYN_create(str(model), "", (w, h), 0.86)
             for scale in (1, 0.5):
                 view = bgr if scale == 1 else cv2.resize(bgr, None, fx=scale, fy=scale,
                                                         interpolation=cv2.INTER_AREA)
@@ -32,14 +38,24 @@ def _detect_faces(pixels):
                     return [face[:4] / scale for face in faces
                             if 0 <= face[4] < vw and 0 <= face[5] < vh]
             return []
-        except cv2.error:
-            # Older OpenCV builds can still use the bundled frontal-face cascade.
-            pass
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    if cascade.empty():
+        except (OSError, cv2.error) as error:
+            LOG.warning("Local YuNet face detection unavailable: %s", error)
+
+    # OpenCV 5 moved Haar cascades out of the standard package. The scene
+    # filter can still prioritize smooth areas without face locations.
+    classifier = getattr(cv2, "CascadeClassifier", None)
+    cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", None)
+    if classifier is None or not cascade_dir:
         return []
-    return cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(30, 30))
+    try:
+        cascade = classifier(str(Path(cascade_dir) / "haarcascade_frontalface_default.xml"))
+        if not cascade.empty():
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            return cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(30, 30))
+    except cv2.error as error:
+        LOG.warning("Local Haar face detection unavailable: %s", error)
+        return []
+    return []
 
 
 def _perforated_margins(gray):

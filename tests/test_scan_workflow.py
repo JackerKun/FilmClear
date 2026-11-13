@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -26,6 +27,15 @@ class ScanWorkflowTest(unittest.TestCase):
         if not path.is_file():
             self.skipTest(f"Local scan fixture is unavailable: {name}")
         return path
+
+    def test_subject_scan_still_finds_dust_without_either_face_detector(self):
+        image = np.full((280, 420, 3), 80, np.uint8)
+        cv2.circle(image, (220, 140), 4, (245, 245, 245), -1)
+        with patch.object(cv2, "FaceDetectorYN_create", side_effect=cv2.error("unavailable"), create=True), \
+                patch.object(cv2, "CascadeClassifier", None, create=True), \
+                self.assertLogs("core.scene_focus", "WARNING"):
+            result = detect_scan(image, PARAMS)
+        self.assertTrue(any(item.center == (220, 140) for item in result.items))
 
     def test_medium_format_frame_uses_exposure_edges_without_sprockets(self):
         scan = read_scan(self.demo_path("2026-10-28-0009.jpg"), read_ir=False)
