@@ -37,7 +37,7 @@ from .batch_crop_dialog import BatchCropDialog, CropSuggestion
 from .crop_dialog import CropDialog
 from .dust_panel import DustPanel
 from .export_dialog import ExportDialog
-from .file_panel import FilePanel
+from .file_panel import IMAGE_EXTENSIONS, FilePanel
 from .image_viewer import DEFAULT_CANVAS_BACKGROUND, RETOUCH_MODES, ImageViewer, defect_path
 from .notice_dialog import NoticeDialog
 from .numeric_fields import use_standard_digits
@@ -1050,7 +1050,7 @@ class MainWindow(QMainWindow):
             return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "添加照片", self._last_directory(),
-            "照片 (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
+            "照片 (" + " ".join("*" + suffix for suffix in sorted(IMAGE_EXTENSIONS)) + ")"
         )
         if paths:
             self._add_photos(paths)
@@ -2338,11 +2338,8 @@ class MainWindow(QMainWindow):
         if self._job is not None:
             return
         self._stash_current()
-        paths = list(dict.fromkeys([
-            *self.file_panel.photo_paths(), *self._photos, self._current_filepath,
-        ]))
         rows = []
-        for path in filter(None, paths):
+        for path in self.file_panel.photo_paths():
             state = self._photos.get(path)
             checked = sum(item.selected for item in state.candidates) if state else 0
             edited = bool(state and state.revision)
@@ -2359,7 +2356,8 @@ class MainWindow(QMainWindow):
         if batch and not any(row[1] for row in rows):
             rows = [(path, path == self._current_filepath, status) for path, _, status in rows]
         default = self.config.get("output_dir", "") or self._last_directory()
-        dialog = ExportDialog(rows, self._current_filepath, Path(default).resolve(), batch, self)
+        dialog = ExportDialog(rows, self._current_filepath, Path(default).resolve(), batch, self,
+                              icons=self.file_panel.photo_icons())
         if dialog.exec() == ExportDialog.Accepted:
             self._start_export(*dialog.selection())
 

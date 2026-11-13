@@ -21,6 +21,7 @@ set "PYINSTALLER_CONFIG_DIR=%CD%\%WORK%\cache"
     --name FilmClear --onedir --windowed --noconfirm --noupx ^
     --distpath "%DIST%" --workpath "%WORK%\work" --specpath "%WORK%" ^
     --collect-data cv2.data ^
+    --additional-hooks-dir "%CD%\tools\pyinstaller_hooks" ^
     --icon "%CD%\assets\filmclear.ico" ^
     --add-data "%CD%\assets\filmclear.png:assets" ^
     --add-data "%CD%\assets\review-report.css:assets" ^

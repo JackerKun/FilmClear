@@ -19,6 +19,7 @@ from core.frame_crop import apply_crop, crop_plan
 from core.dust_item import DustItem
 from core.native_detector import NativeDustDetector
 from ui.batch_crop_dialog import BatchCropDialog
+from ui.export_dialog import ExportDialog
 from ui.image_viewer import RETOUCH_MODES
 from ui.crop_dialog import CropDialog
 from ui.main_window import MainWindow
@@ -678,6 +679,19 @@ class WorkspaceTest(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertIsNone(window._job)
 
+            def export_paths(window, batch):
+                paths = []
+
+                def inspect_dialog(dialog):
+                    photos = dialog.photos
+                    paths.extend(photos.item(row).data(Qt.UserRole) for row in range(photos.count()))
+                    dialog.reject()
+                    return QDialog.Rejected
+
+                with patch.object(ExportDialog, "exec", inspect_dialog):
+                    window._show_export_dialog(batch=batch)
+                return paths
+
             window = create_window()
             window.file_panel.load_files([first, second, third])
             finish_job(window)
@@ -697,6 +711,7 @@ class WorkspaceTest(unittest.TestCase):
             finish_job(window)
             self.assertEqual(window._current_filepath, second_path)
             self.assertEqual(window.file_panel.photo_paths(), [second_path])
+            self.assertEqual(export_paths(window, batch=False), [second_path])
             window.config.set("last_directory", directory)
             prompts = []
 
@@ -720,6 +735,7 @@ class WorkspaceTest(unittest.TestCase):
             self.assertIsNone(window._current_filepath)
             self.assertEqual(window.image_viewer.get_image_size(), (0, 0))
             self.assertEqual(window.file_panel.photo_paths(), [])
+            self.assertEqual(export_paths(window, batch=True), [])
             self.assertTrue(all(path.is_file() for path in (first, second, third)))
             window.close()
 
@@ -729,6 +745,7 @@ class WorkspaceTest(unittest.TestCase):
             window._add_photos([first])
             finish_job(window)
             self.assertTrue(any(item.center == (65, 59) for item in window._dust_items))
+            self.assertEqual(export_paths(window, batch=True), [first_path])
             window.close()
 
     def test_reset_cached_repairs_with_and_without_original_available(self):

@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import tifffile
+from .hdr_input import HEIF_EXTENSIONS, read_heif_pixels
 
 TIFF_EXTENSIONS = {".tif", ".tiff"}
 IR_SUFFIXES = ("_ir", "_infrared")
@@ -17,6 +18,7 @@ class Scan:
     infrared: np.ndarray | None = None
     ir_source: str = ""
     ir_notice: str = ""
+    native_pq: np.ndarray | None = None
 
 
 def signature(path):
@@ -111,11 +113,14 @@ def read_ir_plane(path, shape, *, embedded=False):
     return pixels
 
 
-def read_scan(path, *, read_ir=True):
+def read_scan(path, *, read_ir=True, keep_pq=False):
     path = Path(path)
     image = infrared = None
     source = notice = ""
-    if path.suffix.lower() in TIFF_EXTENSIONS:
+    native_pq = None
+    if path.suffix.lower() in HEIF_EXTENSIONS:
+        image, native_pq = read_heif_pixels(path, keep_pq=keep_pq)
+    elif path.suffix.lower() in TIFF_EXTENSIONS:
         try:
             image, infrared, source = _embedded_ir(path)
         except (tifffile.TiffFileError, ValueError, OSError, NotImplementedError, cv2.error) as error:
@@ -125,7 +130,7 @@ def read_scan(path, *, read_ir=True):
     if image.dtype not in (np.uint8, np.uint16):
         image = _decode(path, cv2.IMREAD_COLOR)
     if not read_ir:
-        return Scan(image)
+        return Scan(image, native_pq=native_pq)
     if read_ir and infrared is None:
         sidecar = ir_sidecar(path)
         if sidecar:
@@ -135,8 +140,8 @@ def read_scan(path, *, read_ir=True):
             except (OSError, ValueError, cv2.error) as error:
                 notice = str(error)
     if infrared is not None and infrared.shape != image.shape[:2]:
-        return Scan(image, ir_notice="红外层和照片尺寸不一致，已使用 RGB")
-    return Scan(image, infrared, source, notice)
+        return Scan(image, ir_notice="红外层和照片尺寸不一致，已使用 RGB", native_pq=native_pq)
+    return Scan(image, infrared, source, notice, native_pq)
 
 
 def display_pixels(image):

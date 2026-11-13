@@ -15,6 +15,12 @@ MIN_WINDOWS_BUILD = 17763  # Windows 10 version 1809, the minimum supported by Q
 def main():
     if sys.argv[1:2] == [WORKER_FLAG]:
         return fetch_latest_release(sys.argv[2]) if len(sys.argv) == 3 else 2
+    if sys.argv[1:2] == ["--check-hdr-codecs"]:
+        if len(sys.argv) != 4:
+            return 2
+        from core.hdr_codec_check import check_hdr_codecs
+
+        return check_hdr_codecs(Path(sys.argv[2]), Path(sys.argv[3]))
 
     # A windowed Windows build has no console. Keep the crash log local.
     log = None
@@ -64,7 +70,7 @@ def run_gui():
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(qt_args)
     app.setApplicationName("FilmClear")
-    app.setApplicationVersion("1.3.5")
+    app.setApplicationVersion("1.3.6")
     app.setOrganizationName("FilmClear")
     app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "filmclear.png")))
 

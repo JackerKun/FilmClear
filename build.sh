@@ -39,6 +39,7 @@ fi
     --name FilmClear --onedir --noconfirm --noupx \
     --distpath "$dist" --workpath "$work/work" --specpath "$work" \
     --collect-data cv2.data \
+    --additional-hooks-dir "$PWD/tools/pyinstaller_hooks" \
     --add-data "$PWD/assets/filmclear.png:assets" \
     --add-data "$PWD/assets/review-report.css:assets" \
     --add-data "$PWD/assets/review-report.js:assets" \

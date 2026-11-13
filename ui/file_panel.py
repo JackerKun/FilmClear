@@ -2,37 +2,53 @@
 
 from pathlib import Path
 
+import cv2
 from PySide6.QtCore import QSignalBlocker, QSize, QThread, Qt, Signal
 from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QPushButton, QVBoxLayout, QWidget,
 )
-from core.scan_io import is_ir_sidecar
+from core.scan_io import HEIF_EXTENSIONS, TIFF_EXTENSIONS, display_pixels, is_ir_sidecar, read_scan
 
 from .tool_icons import tool_icon
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"} | HEIF_EXTENSIONS
 
 
 class Thumbnails(QThread):
     ready = Signal(int, QImage)
 
-    def __init__(self, paths, parent, *, generation):
+    def __init__(self, paths, parent, *, generation=0, size=None):
         super().__init__(parent)
         self.paths = paths
         self.generation = generation
+        self.size = size if size is not None else QSize(104, 88)
 
     def run(self):
         for index, path in enumerate(self.paths):
             if self.isInterruptionRequested():
                 return
-            reader = QImageReader(path)
-            reader.setAutoTransform(True)
-            size = reader.size()
-            if size.isValid():
-                reader.setScaledSize(size.scaled(QSize(104, 88), Qt.KeepAspectRatio))
-            image = reader.read()
+            suffix = Path(path).suffix.lower()
+            image = QImage()
+            if suffix not in HEIF_EXTENSIONS:
+                reader = QImageReader(path)
+                reader.setAutoTransform(True)
+                size = reader.size()
+                if size.isValid():
+                    reader.setScaledSize(size.scaled(self.size, Qt.KeepAspectRatio))
+                image = reader.read()
+            if image.isNull() and suffix in HEIF_EXTENSIONS | TIFF_EXTENSIONS:
+                try:
+                    pixels = read_scan(path, read_ir=False).image
+                except (OSError, ValueError, cv2.error):
+                    continue
+                height, width = pixels.shape[:2]
+                size = QSize(width, height).scaled(self.size, Qt.KeepAspectRatio)
+                pixels = display_pixels(cv2.resize(pixels, (max(1, size.width()), max(1, size.height())),
+                                                   interpolation=cv2.INTER_AREA))
+                image = QImage(pixels.data, pixels.shape[1], pixels.shape[0], pixels.strides[0],
+                               QImage.Format_BGR888).copy()
             if not image.isNull() and not self.isInterruptionRequested():
                 self.ready.emit(index, image)
 
@@ -190,6 +206,9 @@ class FilePanel(QWidget):
 
     def photo_paths(self):
         return list(self._files)
+
+    def photo_icons(self):
+        return {path: self.file_list.item(index).icon() for index, path in enumerate(self._files)}
 
     def photo_at(self, row):
         return self._files[row] if 0 <= row < len(self._files) else None

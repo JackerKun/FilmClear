@@ -97,6 +97,27 @@ jobs:
                       raise SystemExit("FilmClear did not finish the Windows startup check")
           PY
 
+      - name: Check HDR codecs in the bundle
+        shell: bash
+        env:
+          FILMCLEAR_EXECUTABLE: ${{ matrix.entrypoint }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from subprocess import run
+          from tempfile import TemporaryDirectory
+
+          exe = Path(os.environ["FILMCLEAR_EXECUTABLE"]).resolve(strict=True)
+          demo = Path("demo/HDR-window-reference").resolve(strict=True)
+          with TemporaryDirectory() as workdir:
+              log = Path(workdir) / "hdr-codecs.log"
+              result = run([str(exe), "--check-hdr-codecs", str(demo), str(log)], timeout=90)
+              if log.is_file():
+                  print(log.read_text(encoding="utf-8"))
+              result.check_returncode()
+          PY
+
       - name: Archive macOS app
         if: runner.os == 'macOS'
         env:

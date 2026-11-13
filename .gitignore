@@ -225,6 +225,9 @@ __marimo__/
 /output/
 /demo/*
 !/demo/IR-SOURCE.md
+!/demo/HDR-DEMO.md
+!/demo/HDR-window-16bit.tif
+!/demo/HDR-window-reference/
 /models/u2net*.onnx
 
 /filmclear_workspace.sqlite3*
