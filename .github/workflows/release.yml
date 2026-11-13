@@ -132,6 +132,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: FilmClear-*
@@ -145,6 +149,11 @@ jobs:
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
           else
+            notes="docs/releases/$RELEASE_TAG.md"
+            notes_args=(--generate-notes)
+            if [[ -s "$notes" ]]; then
+              notes_args=(--notes-file "$notes")
+            fi
             gh release create "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --title "FilmClear $RELEASE_TAG" --generate-notes
+              --verify-tag --title "FilmClear $RELEASE_TAG" "${notes_args[@]}"
           fi

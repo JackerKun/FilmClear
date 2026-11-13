@@ -7,7 +7,7 @@
 
 ## 下载与运行
 
-在 [GitHub Releases](https://github.com/JackerKun/FilmClear/releases/latest) 选择与系统匹配的归档。新版本的发布说明会先上线，构建完成后，同一页会附上各平台归档和 `SHA256SUMS.txt` 校验文件。
+在 [GitHub Releases](https://github.com/JackerKun/FilmClear/releases/latest) 选择与系统匹配的归档。发布页提供更新说明、各平台下载包和 `SHA256SUMS.txt` 校验文件。
 
 | 系统 | 下载文件 | 解压后启动 |
 | --- | --- | --- |
@@ -16,9 +16,18 @@
 | Windows x64 | `FilmClear-Windows-x64.zip` | 进入 `FilmClear` 文件夹，打开 `FilmClear.exe` |
 | Linux x64 | `FilmClear-Linux-x64.tar.gz` | 在解压目录运行 `./FilmClear/FilmClear` |
 
-Windows 和 Linux 请保留整个解压目录。macOS 构建使用临时签名，跨机器下载时系统可能要求确认。Linux 需要图形桌面及其 Qt 系统库。
+### 系统兼容性
 
-Windows 版要求 **Windows 10 1809（内部版本 17763）或更新的 64 位系统**。Windows 10 企业版 2016 LTSB（1607）缺少 Qt 依赖的 Windows 系统组件，会在加载 `QtWidgets` 时退出。按 `Win + R` 输入 `winver` 可查看系统版本。系统版本符合要求但仍报 DLL 错误时，请先确认 ZIP 已完整解压。
+| 平台 | 发布包支持的系统版本 | 架构 |
+| --- | --- | --- |
+| Windows 10 | 1809（内部版本 17763）至 22H2，含企业版 LTSC 2019 和 LTSC 2021 | x64 |
+| Windows 11 | 21H2、22H2、23H2、24H2、25H2 | x64 |
+| macOS | Sonoma 14.4 起、Sequoia 15、Tahoe 26 | Apple Silicon（arm64）和 Intel（x64），请选择对应下载包 |
+| Linux | Ubuntu 22.04 LTS、24.04 LTS 桌面版 | x64 |
+
+这份列表依据 [Qt 6.12 的平台要求](https://doc.qt.io/qt-6.12/supported-platforms.html) 和 FilmClear 的打包环境。GitHub Actions 在 Windows Server 2025、macOS 15 和 Ubuntu 22.04 上执行打包版启动检查。Linux 需要图形桌面以及 Qt 所需的图形库。Windows 和 Linux 请保留整个解压目录。macOS 构建使用临时签名，跨机器下载时系统可能要求确认。
+
+Windows 10 企业版 2016 LTSB（1607）低于最低要求，缺少 Qt 依赖的 Windows 系统组件。按 `Win + R` 输入 `winver` 可查看系统版本。系统版本符合要求但仍报 DLL 错误时，请先确认 ZIP 已完整解压。
 
 FilmClear 启动后会在后台检查 GitHub 上的最新正式版本。也可通过「说明 → 检查更新」手动查询，或通过「说明 → 打开 GitHub」进入项目主页。发现新版时，点击「去下载」可打开发布页，自行选择下载和安装。离线或检查失败时仍可照常使用。
 
@@ -121,7 +130,7 @@ py -3 -m venv .venv
 | Windows | `build.bat` | `dist/windows/FilmClear/FilmClear.exe` |
 | Linux | `./build.sh` | `dist/linux/FilmClear/FilmClear` |
 
-打包脚本使用独立的 `.venv-build`，并将运行依赖、图标和 YuNet 权重放入产物。首次建立打包环境时，可通过 `FILMCLEAR_PYTHON` 指定 Python 可执行文件。GitHub Actions 在推送 `v*` 标签后构建各平台归档、检查程序启动，并发布下载和校验文件。
+打包脚本使用独立的 `.venv-build`，并将运行依赖、图标和 YuNet 权重放入产物。首次建立打包环境时，可通过 `FILMCLEAR_PYTHON` 指定 Python 可执行文件。发布时在对应标签的提交中保存 `docs/releases/<标签>.md`。推送 `v*` 标签后，GitHub Actions 构建各平台归档、检查程序启动，并把该文件用作新 Release 的正文。
 
 ## 本地样片评测
 
