@@ -327,6 +327,7 @@ class DustPanel(QWidget):
         self.lbl_stats.setObjectName("subtitleLabel")
         summary.addWidget(self.lbl_stats, 1)
         self.btn_check_visible = QPushButton("勾选可见")
+        self.btn_check_visible.setToolTip("勾选可见候选。五官和疑似场景线候选需逐项核对。")
         self.btn_uncheck_visible = QPushButton("清空勾选")
         for button, value in ((self.btn_check_visible, True), (self.btn_uncheck_visible, False)):
             button.setObjectName("textBtn")
@@ -433,11 +434,23 @@ class DustPanel(QWidget):
                     or (mode == "infrared" and item.dust_type != "infrared")
                     or (mode == "checked" and not item.selected)):
                 continue
-            row = QListWidgetItem(f"#{item.id:03d}    {item.type_name}     {item.width} × {item.height} px")
+            protection = " · 五官" if item.face_protected else ""
+            if item.scene_line:
+                protection += " · 场景线待核对"
+            if item.learned_fiber:
+                protection += " · 模型补检"
+            row = QListWidgetItem(f"#{item.id:03d}    {item.type_name}     {item.width} × {item.height} px{protection}")
             row.setData(Qt.UserRole, item.id)
             row.setCheckState(Qt.Checked if item.selected else Qt.Unchecked)
             source = "红外" if item.dust_type == "infrared" else ("RGB 快速预览" if item.preview else "RGB 原图")
-            row.setToolTip(f"{source} · 候选分数 {item.confidence:.2f} · 原图位置 {item.center_x}, {item.center_y}")
+            detail = f"{source} · 候选分数 {item.confidence:.2f} · 原图位置 {item.center_x}, {item.center_y}"
+            if item.face_protected:
+                detail += "\n候选触及五官，默认不勾选。核对后可手动勾选。"
+            if item.scene_line:
+                detail += "\n线条可能属于画面，默认不勾选。核对后可手动勾选。"
+            if item.learned_fiber:
+                detail += "\n模型找回的相似弱线条。核对后可手动勾选。"
+            row.setToolTip(detail)
             self.dust_list.addItem(row)
             if item.id == current_id:
                 self.dust_list.setCurrentItem(row)
@@ -480,8 +493,11 @@ class DustPanel(QWidget):
         self.dust_list.blockSignals(True)
         for index in range(self.dust_list.count()):
             row = self.dust_list.item(index)
+            item = self._items[row.data(Qt.UserRole)]
+            if checked and item.requires_review:
+                continue
             row.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-            self._items[row.data(Qt.UserRole)].selected = checked
+            item.selected = checked
         self.dust_list.blockSignals(False)
         self.select_all_clicked.emit(checked)
         if self.combo_filter.currentData() == "checked":

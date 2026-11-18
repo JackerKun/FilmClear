@@ -10,22 +10,28 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QLocale, QPoint, QPointF, QTimer, Qt
+from PySide6.QtCore import QItemSelectionModel, QLocale, QPoint, QPointF, QTimer, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QDialog, QMenu, QTreeWidget
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QDialog, QMenu, QPushButton, QTreeWidget
 
 from config import Config
+from core.fiber_learning import (FiberExample, FiberLearningStore, FiberModel, read_fiber_model,
+                                 train_fiber_model, write_fiber_model)
 from core.frame_crop import apply_crop, crop_plan
 from core.dust_item import DustItem
 from core.native_detector import NativeDustDetector
+from core.scan_detection import detect_scan
+from core.scan_io import read_scan
 from ui.batch_crop_dialog import BatchCropDialog
 from ui.export_dialog import ExportDialog
+from ui.fiber_learning_dialog import FiberLabelDialog, FiberModelDialog, FiberTrainingDialog
 from ui.image_viewer import RETOUCH_MODES
 from ui.crop_dialog import CropDialog
 from ui.main_window import MainWindow
 from ui.notice_dialog import NoticeDialog
 
 
+@patch("core.fiber_learning._BUNDLED_MODEL", Path())
 class WorkspaceTest(unittest.TestCase):
     def test_numeric_parameters_use_standard_digits_in_chinese_hong_kong_and_macau(self):
         app = QApplication.instance() or QApplication([])
@@ -294,6 +300,329 @@ class WorkspaceTest(unittest.TestCase):
             app.processEvents()
             self.assertTrue(window._sidebar_header_buttons["right"].isChecked())
             self.assertEqual(window.centralWidget().sizes(), original)
+            window.close()
+
+    def test_model_management_imports_previews_and_deletes_without_closing(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):
+            window = MainWindow(restore_workspace=False)
+            folder = Path(directory)
+            paths = [folder / "fibers.json", folder / "scratches.json"]
+            outline = ((0, 70), (15, 5), (100, 0), (20, 80))
+            examples = [FiberExample("p", "r", 1, False, (float(value),) * 14, traced=True,
+                                      outline=outline if value == 0 else ())
+                        for value in range(8)]
+            write_fiber_model(paths[0], train_fiber_model(examples))
+            write_fiber_model(paths[1], train_fiber_model([
+                FiberExample("p", "r", 1, False, (20.,) * 14, traced=True),
+            ]))
+            dialog = FiberModelDialog(window, window._fiber_store, directory)
+            dialog.active_changed.connect(window._set_fiber_model)
+            dialog.show()
+            app.processEvents()
+            try:
+                self.assertEqual({button.text() for button in dialog.findChildren(QPushButton)},
+                                 {"导入 JSON…", "启用所选", "停用所选", "删除所选…", "关闭", "上一页", "下一页"})
+                self.assertFalse(dialog.delete.isEnabled())
+                with patch("ui.fiber_learning_dialog.QFileDialog.getOpenFileNames",
+                           return_value=([str(path) for path in paths], "")):
+                    dialog.import_button.click()
+                self.assertTrue(dialog.isVisible())
+                self.assertEqual(dialog.models.count(), 2)
+                self.assertEqual(dialog.source.text(), str(paths[-1]))
+                self.assertEqual(dialog.gallery.page_text.text(), "1 / 1")
+                self.assertIn("示意", dialog.gallery.tiles[0][2].text())
+                dialog.models.setCurrentRow(1)
+                self.assertEqual(dialog.source.text(), str(paths[0]))
+                self.assertEqual(dialog.gallery.page_text.text(), "1 / 2")
+                self.assertNotIn("示意", dialog.gallery.tiles[0][2].text())
+                self.assertFalse(dialog.gallery.tiles[0][1].pixmap().isNull())
+                dialog.gallery.forward.click()
+                self.assertEqual(dialog.gallery.page_text.text(), "2 / 2")
+                self.assertFalse(dialog.gallery.forward.isEnabled())
+                dialog.models.selectAll()
+                dialog.enable.click()
+                self.assertEqual(len(window._scan_settings()["fiber_model"].members), 2)
+                self.assertEqual(dialog.gallery.page_text.text(), "2 / 2")
+                dialog.models.setCurrentRow(0, QItemSelectionModel.ClearAndSelect)
+                self.assertEqual(dialog.gallery.page_text.text(), "1 / 1")
+                original_json = paths[1].read_bytes()
+                with patch("ui.fiber_learning_dialog.NoticeDialog.exec", return_value=QDialog.Rejected):
+                    dialog.delete.click()
+                self.assertEqual(dialog.models.count(), 2)
+                with patch("ui.fiber_learning_dialog.NoticeDialog.exec", return_value=QDialog.Accepted):
+                    dialog.delete.click()
+                self.assertEqual(paths[1].read_bytes(), original_json)
+                self.assertEqual(dialog.models.count(), 1)
+                self.assertEqual(dialog.source.text(), str(paths[0]))
+                self.assertEqual(window._scan_settings()["fiber_model"], read_fiber_model(paths[0]))
+                self.assertEqual(dialog.gallery.page_text.text(), "1 / 2")
+                dialog.gallery.forward.click()
+                self.assertEqual(dialog.gallery.page_text.text(), "2 / 2")
+                dialog.disable.click()
+                self.assertNotIn("fiber_model", window._scan_settings())
+                self.assertTrue(dialog.isVisible())
+            finally:
+                dialog.close_button.click()
+                self.assertFalse(dialog.isVisible())
+                window.close()
+                window._stop_workers()
+
+    def test_annotation_training_shows_all_saved_contours_and_uses_the_displayed_samples(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            store = FiberLearningStore(folder / "config.json")
+            imported = train_fiber_model([FiberExample("p", "r", 1, False, (3.,) * 14, traced=True)])
+            imported_id, = store.add_models([("已导入", "/tmp/existing.json", imported)])
+            store.set_enabled([imported_id], True)
+            contour = np.array([[[15, 20]], [[50, 24]], [[45, 29]], [[15, 24]]], np.int32)
+            trace = DustItem(1, 15, 20, 36, 10, 144, 31, 24, dust_type="scratch", contour=contour)
+            for i in range(8):
+                store.label_many(f"old-photo-{i}", "old roll", 1, [(f"trace-{i}", True, (.9,) * 14, trace)])
+            store.label("legacy-photo", "legacy roll", "scene", 0, True, (.2,) * 14)
+            dialog = FiberLabelDialog(None, folder / "current.jpg", np.zeros((80, 100, 3), np.uint8),
+                                      [(trace, "current-scene", (.1,) * 14)], store, "current",
+                                      params={}, can_previous=False, can_next=False, model=None)
+            dialog.show()
+            app.processEvents()
+            dialog.candidates.setCurrentRow(0)
+            dialog.label_buttons[1].click()
+            dialog.tabs.setCurrentIndex(dialog.training_index)
+            app.processEvents()
+            panel = dialog.training
+            self.assertEqual(panel.summary.text(), "已保存 10 处标注")
+            self.assertEqual(panel.gallery.page_text.text(), "1 / 2")
+            self.assertIn("真实缺陷", panel.gallery.tiles[0][2].text())
+            self.assertIn("示意", panel.gallery.tiles[8][2].text())
+            panel.gallery.forward.click()
+            self.assertIn("画面线条", panel.gallery.tiles[0][2].text())
+            self.assertNotIn("示意", panel.gallery.tiles[0][2].text())
+            self.assertTrue(panel._examples[-1].outline)
+            self.assertFalse(panel._examples[-1].traced)
+            QTest.keyClick(panel.train, Qt.Key_Space)
+            deadline = time.monotonic() + 10
+            while panel.busy and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(.01)
+            if panel.busy:
+                panel._job.requestInterruption()
+                panel._job.wait()
+            self.assertFalse(panel.busy)
+            self.assertTrue(dialog.isVisible())
+            entry, existing = store.library()
+            self.assertEqual(entry.model.metrics["samples"], 10)
+            self.assertFalse(entry.enabled)
+            self.assertEqual(existing.model, imported)
+            exported = folder / "trained.json"
+            with patch("ui.fiber_learning_dialog.QFileDialog.getSaveFileName", return_value=(str(exported), "")):
+                panel.export.click()
+            self.assertEqual(read_fiber_model(exported), entry.model)
+            dialog.close_button.click()
+            reopened = FiberTrainingDialog(None, FiberLearningStore(folder / "config.json"))
+            self.assertEqual(reopened.panel.summary.text(), "已保存 10 处标注")
+            self.assertTrue(reopened.panel.export.isEnabled())
+            self.assertEqual(reopened.panel._model, entry.model)
+            reopened.close()
+
+    def test_space_drag_keeps_brush_active_and_guides_a_faint_scratch(self):
+        app = QApplication.instance() or QApplication([])
+        source = Path(__file__).resolve().parents[1] / "demo" / "HDR-window-16bit.tif"
+        image = read_scan(source, read_ir=False).image
+        params = dict(threshold=20, min_area=3, min_confidence=.34)
+        with tempfile.TemporaryDirectory() as directory:
+            store = FiberLearningStore(Path(directory) / "config.json")
+            dialog = FiberLabelDialog(None, source, image, [], store, "test-photo", params=params,
+                                      can_previous=False, can_next=False, model=None,
+                                      start_view=(False, 2.88, 470, 461))
+            dialog.show()
+            app.processEvents()
+            canvas = dialog.canvas
+            viewport = canvas.viewport()
+            middle = viewport.rect().center()
+            scrollbar = canvas.horizontalScrollBar()
+            before = scrollbar.value()
+            dialog.draw_button.setFocus()
+            QTest.keyPress(dialog.draw_button, Qt.Key_Space)
+            QTest.mousePress(viewport, Qt.LeftButton, pos=middle)
+            QTest.mouseMove(viewport, middle + QPoint(60, 0))
+            QTest.mouseRelease(viewport, Qt.LeftButton, pos=middle + QPoint(60, 0))
+            QTest.keyRelease(canvas, Qt.Key_Space)
+            self.assertLess(scrollbar.value(), before)
+            self.assertIsNone(dialog._job)
+            self.assertFalse(canvas.space_pan)
+
+            start, end = (canvas.image_position(point) for point in ((486, 441), (458, 481)))
+            QTest.mousePress(viewport, Qt.LeftButton, pos=start)
+            QTest.mouseMove(viewport, (start + end) / 2)
+            QTest.mouseRelease(viewport, Qt.LeftButton, pos=end)
+            deadline = time.monotonic() + 15
+            while dialog._job is not None and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            if dialog._job is not None:
+                dialog._job.requestInterruption()
+                dialog._job.wait()
+            self.assertIsNone(dialog._job)
+            item, key, _ = next(row for row in dialog.rows if row[0].height >= 39)
+            self.assertIn(key, dialog._checked)
+            self.assertEqual(item.dust_type, "scratch")
+            self.assertLessEqual(item.y, 443)
+            self.assertGreaterEqual(item.y + item.height, 480)
+            dialog.save_defects.click()
+            self.assertEqual(store.counts(), (1, 0, 1))
+            dialog.close()
+
+    def test_brush_and_box_label_original_contours_for_future_scans(self):
+        app = QApplication.instance() or QApplication([])
+        demo = Path(__file__).resolve().parents[1] / "demo"
+        source = demo / "HDR-window-16bit.tif"
+        image = read_scan(source, read_ir=False).image
+        params = dict(threshold=20, min_area=3, min_confidence=.34)
+        with tempfile.TemporaryDirectory() as directory:
+            store = FiberLearningStore(Path(directory) / "config.json")
+
+            def dialog_for_photo():
+                return FiberLabelDialog(None, source, image, [], store, "test-photo", params=params,
+                                        can_previous=False, can_next=False, model=None)
+
+            dialog = dialog_for_photo()
+            dialog.show()
+            app.processEvents()
+            canvas = dialog.canvas
+
+            def drag(points):
+                points = [canvas.image_position(point) for point in points]
+                QTest.mousePress(canvas.viewport(), Qt.LeftButton, pos=points[0])
+                for point in points[1:-1]:
+                    QTest.mouseMove(canvas.viewport(), point)
+                QTest.mouseRelease(canvas.viewport(), Qt.LeftButton, pos=points[-1])
+                deadline = time.monotonic() + 15
+                while dialog._job is not None and time.monotonic() < deadline:
+                    app.processEvents()
+                    time.sleep(0.01)
+                if dialog._job is not None:
+                    dialog._job.requestInterruption()
+                    dialog._job.wait()
+                self.assertIsNone(dialog._job)
+
+            drag([(1005, 588), (1023, 585), (1036, 600), (1032, 612), (1021, 621)])
+            hook = (1003, 582, 36, 41)
+            self.assertTrue(any(item.bbox == hook for item, _, _ in dialog.rows))
+            box = next(button for button in dialog.modes.buttons() if button.property("selectionMode") == "detect")
+            box.click()
+            drag([(975, 572), (1052, 639)])
+            self.assertEqual(sum(item.bbox == hook for item, _, _ in dialog.rows), 1)
+            for index, (item, _, _) in enumerate(dialog.rows):
+                if item.bbox != hook:
+                    dialog.candidates.item(index).setCheckState(Qt.Unchecked)
+            dialog.save_defects.click()
+            self.assertEqual(store.counts(), (1, 0, 1))
+            dialog.close()
+            dialog = dialog_for_photo()
+            self.assertEqual([item.bbox for item, _, _ in dialog.rows], [hook])
+            model = FiberModel.decode(train_fiber_model(store.examples()).encode())
+            self.assertTrue(model.templates)
+            other = read_scan(demo / "HDR-window-reference" / "HDR-window-UltraHDR.jpg", read_ir=False).image
+            self.assertFalse(any(item.bbox == hook for item in detect_scan(other, params).items))
+            match, = [item for item in detect_scan(other, params, fiber_model=model).items if item.bbox == hook]
+            self.assertFalse(match.selected)
+
+    def test_marker_modes_use_the_displayed_shape_and_survive_reopen(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as directory, patch("ui.main_window.Config", lambda: Config(directory)):
+            window = MainWindow()
+            self.addCleanup(window._stop_workers)
+            window.show()
+            image = np.full((240, 280, 3), 85, np.uint8)
+            window._original_image = window._current_image = image
+            viewer = window.image_viewer
+            viewer.load_image(image)
+            window._refresh_controls()
+            viewer.zoom_100()
+            contour = np.array([(60, 50), (155, 50), (155, 58), (68, 58), (68, 150), (60, 150)], np.int32)
+            fiber = DustItem(1, 60, 50, 96, 101, 1500, 100, 54, dust_type="fiber", contour=contour)
+            viewer.update_annotations([fiber])
+            app.processEvents()
+
+            def marker_visible(canvas, point):
+                pixels = canvas.viewport().grab().toImage()
+                position = canvas.image_position(point) * pixels.devicePixelRatio()
+                color = pixels.pixelColor(position)
+                return color.green() - color.red() > 25
+
+            clicked = []
+            viewer.annotation_clicked.connect(clicked.append)
+            end = viewer.image_position((64, 141))
+            center = viewer.image_position(fiber.center)
+            self.assertTrue(window._marker_style_actions["contour"].isChecked())
+            self.assertTrue(marker_visible(viewer, (60, 140)))
+            QTest.mouseClick(viewer.viewport(), Qt.LeftButton, pos=end)
+            QTest.mouseClick(viewer.viewport(), Qt.LeftButton, pos=viewer.image_position((110, 100)))
+            self.assertEqual(clicked, [1])
+
+            window._marker_style_actions["circle"].trigger()
+            self.assertFalse(window._marker_style_actions["contour"].isChecked())
+            self.assertFalse(marker_visible(viewer, (60, 140)))
+            QTest.mouseClick(viewer.viewport(), Qt.LeftButton, pos=end)
+            QTest.mouseClick(viewer.viewport(), Qt.LeftButton, pos=center)
+            self.assertEqual(clicked, [1, 1])
+            viewer.reset_highlight()
+            self.assertTrue(marker_visible(viewer, (103, 54)))
+
+            viewer.set_comparison(image)
+            viewer.set_original_marks([fiber])
+            self.assertFalse(marker_visible(viewer, (60, 140)))
+            window._marker_style_actions["contour"].trigger()
+            self.assertTrue(marker_visible(viewer, (60, 140)))
+            window._marker_style_actions["circle"].trigger()
+            window.close()
+
+            reopened = MainWindow()
+            self.addCleanup(reopened._stop_workers)
+            self.assertTrue(reopened._marker_style_actions["circle"].isChecked())
+            self.assertEqual(reopened.original_viewer._marker_style, "circle")
+            reopened.close()
+
+    def test_bulk_selection_skips_candidates_awaiting_review(self):
+        app = QApplication.instance() or QApplication([])
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("ui.main_window.Config", lambda: Config(directory)),
+        ):
+            window = MainWindow()
+            self.addCleanup(window._stop_workers)
+            window._original_image = window._current_image = np.full((105, 120, 3), 110, np.uint8)
+            ordinary = DustItem(1, 20, 20, 5, 5, 25, 22, 22)
+            protected = DustItem(2, 80, 30, 5, 5, 25, 82, 32, face_protected=True)
+            line = DustItem(3, 40, 60, 32, 4, 128, 54, 62, dust_type="scratch", scene_line=True)
+            old_line = DustItem(3, 40, 60, 32, 4, 128, 54, 62, dust_type="scratch")
+            learned = DustItem(4, 36, 79, 26, 8, 70, 48, 83, dust_type="fiber", learned_fiber=True)
+            window._on_detection_finished([ordinary, protected, old_line], None)
+            self.assertTrue(window._dust_items[2].selected)
+            window._on_detection_finished([ordinary, protected, line, learned], None)
+            app.processEvents()
+            panel = window.dust_panel
+            self.assertEqual([item.selected for item in window._dust_items], [True, False, False, False])
+            self.assertIn("场景线待核对", panel.dust_list.item(2).text())
+            self.assertIn("模型补检", panel.dust_list.item(3).text())
+            self.assertFalse(window._merge_scan_review([learned], [], [])[0].selected)
+            panel.btn_check_visible.click()
+            self.assertFalse(window._dust_items[1].selected)
+            self.assertFalse(window._dust_items[2].selected)
+            self.assertFalse(window._dust_items[3].selected)
+            panel.dust_list.item(1).setCheckState(Qt.Checked)
+            panel.dust_list.item(2).setCheckState(Qt.Checked)
+            panel.dust_list.item(3).setCheckState(Qt.Checked)
+            window._on_detection_finished([ordinary, protected, line, learned], None)
+            self.assertTrue(window._dust_items[1].selected)
+            self.assertTrue(window._dust_items[2].selected)
+            self.assertTrue(window._dust_items[3].selected)
+            panel.btn_uncheck_visible.click()
+            window._on_detection_finished([protected], (74, 23, 95, 49))
+            window._on_detection_finished([line], (39, 59, 74, 65))
+            self.assertFalse(window._dust_items[1].selected)
+            self.assertFalse(window._dust_items[2].selected)
             window.close()
 
     def test_review_and_pixel_history(self):

@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .frame_crop import _frame_defaults, _frame_lines
 from .scan_io import display_pixels
 
 _MODELS = Path(__file__).resolve().parents[1] / "models"
@@ -35,7 +36,7 @@ def _detect_faces(pixels):
                 detector.setInputSize(view.shape[1::-1])
                 _, faces = detector.detect(view)
                 if faces is not None:
-                    return [face[:4] / scale for face in faces
+                    return [face[:14] / scale for face in faces
                             if 0 <= face[4] < vw and 0 <= face[5] < vh]
             return []
         except (OSError, cv2.error) as error:
@@ -128,10 +129,28 @@ def _dark_frame_margins(gray):
     return margins if any((axis, False) in strong and (axis, True) in strong for axis in (0, 1)) else []
 
 
+def _perforated_exposure(gray):
+    if min(gray.shape) < 120:
+        return ()
+    result = _frame_lines(gray, _frame_defaults(gray.shape))
+    if result is None or not result[2]:
+        return ()
+    edges, scores, _ = result
+    planes = []
+    for index, (edge, score, inward) in enumerate(zip(edges, scores, (1, -1, -1, 1))):
+        normal_x, normal_y, offset = edge * inward
+        # With opposing sprocket rows confirmed, also screen the narrow
+        # scanner fringe when a dark side of the exposure cannot be traced.
+        depth = gray.shape[index % 2]
+        margin = 1.5 if score > 0 else 0.008 * depth
+        planes.append((normal_x, normal_y, offset - margin))
+    return tuple(planes)
+
+
 class SceneFocus:
     """Rate film candidates in the scene without changing their contours."""
 
-    def __init__(self, image, *, prioritize_subject=True):
+    def __init__(self, image, *, prioritize_subject=True, filter_scene=True):
         height, width = image.shape[:2]
         scale = min(1, 1000 / max(height, width))
         thumb = image if scale == 1 else cv2.resize(
@@ -143,18 +162,65 @@ class SceneFocus:
         h, w = gray.shape
         self.shape = gray.shape
         self.factors = (w / width, h / height)
-        self.margins = _perforated_margins(gray) + _dark_frame_margins(gray)
-        self.faces = []
+        self.margins = _perforated_margins(gray) + _dark_frame_margins(gray) if filter_scene else []
+        self.exposure = _perforated_exposure(gray) if filter_scene else ()
+        faces = _detect_faces(pixels)
+        self.faces = [face[:4] for face in faces]
+        self.features = [ellipse for face in faces for ellipse in self._facial_features(face)]
         self.texture = None
-        if not prioritize_subject:
+        if not prioritize_subject or not filter_scene:
             return
-        self.faces = _detect_faces(pixels)
         soft = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.2)
         dx = cv2.Sobel(soft, -1, 1, 0, ksize=3, scale=1 / 8)
         dy = cv2.Sobel(soft, -1, 0, 1, ksize=3, scale=1 / 8)
         gradient = cv2.blur(cv2.magnitude(dx, dy), (19, 19))
         fine_detail = cv2.blur(np.abs(gray - soft), (19, 19))
         self.texture = np.clip(np.maximum((fine_detail - 4) / 4, (gradient - 4) / 7), 0, 1)
+
+    @staticmethod
+    def _facial_features(face):
+        x, y, w, h = face[:4]
+        if len(face) >= 14:
+            eye_a, eye_b, nose, lip_a, lip_b = face[4:14].reshape(5, 2)
+            mouth = (lip_a + lip_b) / 2
+            mouth_width = max(abs(lip_a[0] - lip_b[0]), 0.22 * w)
+        else:
+            eye_a, eye_b = (x + 0.30 * w, y + 0.38 * h), (x + 0.70 * w, y + 0.38 * h)
+            nose, mouth = (x + 0.50 * w, y + 0.55 * h), (x + 0.50 * w, y + 0.76 * h)
+            mouth_width = 0.42 * w
+        return (
+            ((eye_a[0], eye_a[1] - 0.045 * h), (0.22 * w, 0.15 * h)),
+            ((eye_b[0], eye_b[1] - 0.045 * h), (0.22 * w, 0.15 * h)),
+            (nose, (0.16 * w, 0.13 * h)),
+            (mouth, (0.5 * mouth_width + 0.09 * w, 0.13 * h)),
+        )
+
+    def protect_features(self, items):
+        """Keep candidates touching sensitive facial features available for review."""
+        sx, sy = self.factors
+        for item in items:
+            left, top = item.x * sx, item.y * sy
+            right, bottom = (item.x + item.width) * sx, (item.y + item.height) * sy
+            for (cx, cy), (rx, ry) in self.features:
+                # Include the narrow padding applied around a repair contour.
+                rx, ry = rx + 3 * sx, ry + 3 * sy
+                px, py = min(max(cx, left), right), min(max(cy, top), bottom)
+                if ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 > 1:
+                    continue
+                if item.contour is not None:
+                    # Check the actual filled shape in ellipse coordinates, so a
+                    # curved fiber's empty bounding box cannot protect an eye.
+                    factors = np.array((sx, sy)) / (rx, ry)
+                    center = np.array((cx, cy)) / (rx, ry)
+                    contour = (item.contour * factors - center).astype(np.float32)
+                    if cv2.pointPolygonTest(contour, (0, 0), True) < -1:
+                        continue
+                    if any(cv2.pointPolygonTest((hole * factors - center).astype(np.float32),
+                                                (0, 0), True) > 1 for hole in item.holes):
+                        continue
+                item.face_protected = True
+                item.selected = False
+                break
 
     def forehead_regions(self):
         """Look for coherent narrow fibers above the eyes at original resolution."""
@@ -163,14 +229,35 @@ class SceneFocus:
             yield (round((x + 0.04 * width) / sx), round((y - 0.15 * height) / sy),
                    round((x + 0.96 * width) / sx), round((y + 0.35 * height) / sy))
 
+    def within_exposure(self, item):
+        sx, sy = self.factors
+        if self.exposure:
+            low = (item.x * sx, item.y * sy)
+            high = ((item.x + item.width - 1) * sx, (item.y + item.height - 1) * sy)
+            for a, b, offset in self.exposure:
+                worst = a * (low[0] if a >= 0 else high[0]) + b * (low[1] if b >= 0 else high[1])
+                if worst + offset >= 0:
+                    continue
+                if item.contour is None or np.any(item.contour.reshape(-1, 2) @ (a * sx, b * sy) + offset < 0):
+                    return False
+            return True
+        point = (round(item.center_x * sx), round(item.center_y * sy))
+        if item.dust_type not in ("fiber", "scratch", "infrared"):
+            return not any((point[axis] >= boundary) == bottom for axis, bottom, boundary in self.margins)
+        low = (item.x * sx, item.y * sy)
+        high = ((item.x + item.width - 1) * sx, (item.y + item.height - 1) * sy)
+        return not any((high[axis] >= boundary if bottom else low[axis] < boundary)
+                       for axis, bottom, boundary in self.margins)
+
     def filter(self, items, min_confidence):
         kept = []
         h, w = self.shape
         sx, sy = self.factors
         for item in items:
             point = (min(w - 1, round(item.center_x * sx)), min(h - 1, round(item.center_y * sy)))
-            if any((point[axis] >= boundary) == bottom for axis, bottom, boundary in self.margins):
+            if not self.within_exposure(item):
                 continue
+            linear = item.dust_type in ("fiber", "scratch")
             if self.texture is None:
                 kept.append(item)
                 continue
@@ -179,7 +266,7 @@ class SceneFocus:
                        and top - 0.20 * height <= y <= top + height
                        for left, top, width, height in self.faces)
             texture = float(self.texture[y, x])
-            if item.dust_type in ("fiber", "scratch"):
+            if linear:
                 cutoff = 0.59 + (0.04 if face else 0.13) * texture
             else:
                 cutoff = min_confidence + (0.06 if face else 0.20) * texture

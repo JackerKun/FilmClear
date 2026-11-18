@@ -4,7 +4,9 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtGui import (
+    QBrush, QColor, QImage, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QTransform,
+)
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QRubberBand
 
 
@@ -71,7 +73,8 @@ class ImageViewer(QGraphicsView):
 
         self._items = {}
         self._focus_id = None
-        self._focus_path = None
+        self._mark_paths = {}
+        self._marker_style = "contour"
         self._show_all = False
         self._fit = True
         self._before = QPixmap()
@@ -165,20 +168,36 @@ class ImageViewer(QGraphicsView):
 
     def update_annotations(self, dust_items):
         self._items = {item.id: item for item in dust_items}
+        self._mark_paths.clear()
         self.reset_highlight()
 
     def set_show_all(self, visible):
         self._show_all = visible
         self.viewport().update()
 
+    def set_marker_style(self, style):
+        self._marker_style = style
+        self.viewport().update()
+
+    def _contour_path(self, item):
+        key = id(item)
+        if key not in self._mark_paths:
+            self._mark_paths[key] = defect_path(item)
+        return self._mark_paths[key]
+
+    def _draw_marker(self, painter, item, radius):
+        if self._marker_style == "contour":
+            painter.drawPath(self._contour_path(item))
+        else:
+            image_radius = radius / self.transform().m11()
+            painter.drawEllipse(QPointF(*item.center), image_radius, image_radius)
+
     def highlight_dust(self, dust_id, *, locate=False, min_zoom=0.65):
         dust = self._items.get(dust_id)
         if dust is None:
             self.reset_highlight()
             return
-        if self._focus_id != dust_id:
-            self._focus_id = dust_id
-            self._focus_path = defect_path(dust)
+        self._focus_id = dust_id
         if locate:
             if self.transform().m11() < min_zoom:
                 self._zoom_to(min_zoom)
@@ -187,7 +206,6 @@ class ImageViewer(QGraphicsView):
 
     def reset_highlight(self):
         self._focus_id = None
-        self._focus_path = None
         self.viewport().update()
 
     def set_comparison(self, original):
@@ -198,6 +216,7 @@ class ImageViewer(QGraphicsView):
     def clear_comparison(self):
         self._before = QPixmap()
         self._before_marks = []
+        self._mark_paths.clear()
         self._dragging_split = False
         self._update_tool_cursor()
         self.viewport().update()
@@ -209,6 +228,7 @@ class ImageViewer(QGraphicsView):
 
     def set_original_marks(self, items):
         self._before_marks = items
+        self._mark_paths.clear()
         self.viewport().update()
 
     def drawForeground(self, painter, rect):
@@ -240,18 +260,15 @@ class ImageViewer(QGraphicsView):
         self._draw_marks(painter, rect, self._items.values(), skip_id=self._focus_id)
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-        if self._focus_path is not None:
+        focus = self._items.get(self._focus_id)
+        if focus is not None:
+            painter.setBrush(Qt.NoBrush)
             for color, width in (("#17232d", 4), ("#64ebd2", 2)):
                 pen = QPen(QColor(color))
                 pen.setWidthF(width)
                 pen.setCosmetic(True)
                 painter.setPen(pen)
-                painter.drawPath(self._focus_path)
-            focus = self._items[self._focus_id]
-            point = QPointF(*focus.center)
-            radius = 9 / self.transform().m11()
-            if max(focus.width, focus.height) * self.transform().m11() < 18:
-                painter.drawEllipse(point, radius, radius)
+                self._draw_marker(painter, focus, 9)
         if self._stroke:
             search = self._selection_mode == "draw"
             radius = self.brush_radius if search else self.retouch_radius
@@ -295,16 +312,21 @@ class ImageViewer(QGraphicsView):
             return
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(Qt.NoBrush)
+        margin = 6 / self.transform().m11()
+        visible = rect.adjusted(-margin, -margin, margin, margin)
         for item in items:
-            point = QPointF(*item.center)
-            if item.id == skip_id or not rect.contains(point):
+            if item.id == skip_id:
+                continue
+            in_view = (visible.intersects(QRectF(*item.bbox)) if self._marker_style == "contour"
+                       else visible.contains(QPointF(*item.center)))
+            if not in_view:
                 continue
             pen = QPen(QColor("#65dfcc") if item.selected else QColor("#e6bb72"))
             pen.setCosmetic(True)
             pen.setWidthF(1.25)
             painter.setPen(pen)
-            radius = (4 if item.selected else 3) / self.transform().m11()
-            painter.drawEllipse(point, radius, radius)
+            self._draw_marker(painter, item, 4 if item.selected else 3)
         painter.restore()
 
     def _draw_badge(self, painter):
@@ -613,6 +635,11 @@ class ImageViewer(QGraphicsView):
     def _annotation_at(self, pos):
         if not self._before.isNull() or self.comparison_label:
             return None
+        point = self.image_point(pos)
+        if self._photo.crop_path is not None and not self._photo.crop_path.contains(point):
+            return None
+        if self._marker_style == "contour":
+            return self._contour_at(point)
         best = None
         best_distance = 10
         for item in self._items.values():
@@ -620,4 +647,24 @@ class ImageViewer(QGraphicsView):
                 distance = (self.image_position(item.center) - pos).manhattanLength()
                 if distance < best_distance:
                     best, best_distance = item.id, distance
+        return best
+
+    def _contour_at(self, point):
+        tolerance = 4 / self.transform().m11()
+        stroker = QPainterPathStroker()
+        stroker.setWidth(2 * tolerance)
+        stroker.setJoinStyle(Qt.RoundJoin)
+        best = None
+        best_rank = (2, math.inf)
+        for item in self._items.values():
+            if not self._show_all and item.id != self._focus_id:
+                continue
+            bounds = QRectF(*item.bbox).adjusted(-tolerance, -tolerance, tolerance, tolerance)
+            if not bounds.contains(point):
+                continue
+            path = self._contour_path(item)
+            inside = path.contains(point)
+            rank = (0 if inside else 1, (QPointF(*item.center) - point).manhattanLength())
+            if rank < best_rank and (inside or stroker.createStroke(path).contains(point)):
+                best, best_rank = item.id, rank
         return best

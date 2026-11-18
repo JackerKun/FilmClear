@@ -11,8 +11,10 @@ from zipfile import BadZipFile
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QPoint, QProcess, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QUndoCommand, QUndoStack
+from PySide6.QtCore import QEvent, QPoint, QProcess, QRectF, QSize, QTimer, Qt, QUrl
+from PySide6.QtGui import (
+    QAction, QActionGroup, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QUndoCommand, QUndoStack,
+)
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QBoxLayout, QButtonGroup, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
@@ -23,6 +25,9 @@ from PySide6.QtWidgets import (
 from config import Config
 from core.batch_export import ExportEntry, export_batch, replay_patches
 from core.dust_remover import DustRemover
+from core.fiber_learning import (
+    LINE_TYPES, FiberLearningStore, candidate_key, fiber_features, photo_fingerprint,
+)
 from core.frame_crop import crop_from_edges, crop_plan, detect_frame
 from core.inspection import dust_view, infrared_view
 from core.manual_retouch import covered_candidates, retouch_patch
@@ -37,6 +42,7 @@ from .batch_crop_dialog import BatchCropDialog, CropSuggestion
 from .crop_dialog import CropDialog
 from .dust_panel import DustPanel
 from .export_dialog import ExportDialog
+from .fiber_learning_dialog import FiberLabelDialog, FiberModelDialog, FiberTrainingDialog
 from .file_panel import IMAGE_EXTENSIONS, FilePanel
 from .image_viewer import DEFAULT_CANVAS_BACKGROUND, RETOUCH_MODES, ImageViewer, defect_path
 from .notice_dialog import NoticeDialog
@@ -46,37 +52,7 @@ from .repeat_dialog import RepeatDialog
 from .theme_manager import ThemeManager
 from .tool_icons import tool_icon
 from .update_checker import UpdateChecker
-
-
-class WorkspaceJob(QThread):
-    completed = Signal(object)
-    failed = Signal(str)
-    progress = Signal(str)
-    counts = Signal(int, int)
-    item_ready = Signal(object)
-
-    def __init__(self, work, parent, *, stream=False):
-        super().__init__(parent)
-        self.work = work
-        self.stream = stream
-
-    def run(self):
-        try:
-            args = (self._report_progress, self.item_ready.emit) if self.stream else (self._report_progress,)
-            result = self.work(*args)
-            if not self.isInterruptionRequested():
-                self.completed.emit(result)
-        except InterruptedError:
-            return
-        except Exception as error:
-            self.failed.emit(str(error))
-
-    def _report_progress(self, message, done=None, total=None):
-        if self.isInterruptionRequested():
-            raise InterruptedError
-        self.progress.emit(message)
-        if total is not None:
-            self.counts.emit(done, total)
+from .workspace_job import WorkspaceJob
 
 
 class BusySpinner(QWidget):
@@ -187,6 +163,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = Config()
         self._workspace = WorkspaceStore(self.config.config_path)
+        self._fiber_store = FiberLearningStore(self.config.config_path)
+        self._fiber_model = None
+        try:
+            self._fiber_model = self._fiber_store.active_model(
+                legacy_enabled=self.config.get("fiber_learning_enabled", True)
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            logging.warning("Fiber review model unavailable: %s", error)
         self._workspace_dirty = set()
         self._workspace_manifest_dirty = False
         self._restoring_workspace = False
@@ -366,7 +350,7 @@ class MainWindow(QMainWindow):
         self.edit_toolbar.setAccessibleName("画布工具")
         edit_layout = QHBoxLayout(self.edit_toolbar)
         edit_layout.setContentsMargins(4, 5, 4, 5)
-        edit_layout.setSpacing(2)
+        edit_layout.setSpacing(1)
         self.edit_group = QButtonGroup(self.edit_toolbar)
         self.edit_buttons = {}
         for mode, label, name, hint in (
@@ -405,6 +389,20 @@ class MainWindow(QMainWindow):
         self.btn_marks.toggled.connect(self._toggle_marks)
         self.btn_marks.setChecked(True)
         edit_layout.addWidget(self.btn_marks)
+        self.btn_marker_style = self._tool("▾", "缺陷标记样式", self._show_marker_style_menu)
+        self.btn_marker_style.setObjectName("canvasToolBtn")
+        self.btn_marker_style.setAccessibleName("缺陷标记样式")
+        self.btn_marker_style.setFixedWidth(20)
+        self.marker_style_menu = QMenu("缺陷标记样式", self.btn_marker_style)
+        style_group = QActionGroup(self.marker_style_menu)
+        self._marker_style_actions = {}
+        for style, label in (("contour", "轮廓"), ("circle", "圆圈")):
+            action = self.marker_style_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked, value=style: self._set_marker_style(value))
+            style_group.addAction(action)
+            self._marker_style_actions[style] = action
+        edit_layout.addWidget(self.btn_marker_style)
         edit_layout.addWidget(self.brush_radius)
         edit_layout.addStretch()
         self.btn_fit = self._tool("", "适应窗口", self.image_viewer.fit_to_window)
@@ -602,6 +600,9 @@ class MainWindow(QMainWindow):
             self._action(tool_menu, "缩小工具半径", lambda: self._step_tool_radius(-1), "["),
             self._action(tool_menu, "放大工具半径", lambda: self._step_tool_radius(1), "]"),
         )
+        learning_menu = tool_menu.addMenu("毛絮学习")
+        self._fiber_label_action = self._action(learning_menu, "标注与训练…", self._show_fiber_labels)
+        self._fiber_model_action = self._action(learning_menu, "模型管理…", self._show_fiber_models)
 
         view_menu = self.menuBar().addMenu("视图")
         self._button_shortcut(view_menu, "前后对比", self.btn_compare, "B")
@@ -611,6 +612,7 @@ class MainWindow(QMainWindow):
                                   lambda _, value=mode: self._show_comparison_layout(value), shortcut)
             self._comparison_actions.append(action)
         self._button_shortcut(view_menu, "切换候选标记", self.btn_marks, "M")
+        view_menu.addMenu(self.marker_style_menu)
         self._action(view_menu, "上一处候选", lambda: self._step_candidate(-1), "K")
         self._action(view_menu, "下一处候选", lambda: self._step_candidate(1), "J")
         self._action(view_menu, "原图核对候选", self._refine_current_candidate, "R")
@@ -823,6 +825,7 @@ class MainWindow(QMainWindow):
         self.theme_manager.set_theme(self.config.get("theme", "dark"))
         background = self.config.get("canvas_background")
         self._set_canvas_background(background if isinstance(background, str) and QColor(background).isValid() else None)
+        self._set_marker_style(self.config.get("marker_style", "contour"))
         self.resize(self.config.get("window.width", 1400), self.config.get("window.height", 900))
         for side, panel in self._sidebar_panels.items():
             width = self.config.get(f"sidebars.{side}.width", self._sidebar_widths[side])
@@ -975,6 +978,7 @@ class MainWindow(QMainWindow):
             ((self.btn_compare, *self._comparison_actions), bool(self._applied_patches)),
             ((self.btn_prev, self.btn_next, self.btn_batch_crop), has_photos),
             ((self.dust_panel.btn_check_visible, self.dust_panel.btn_uncheck_visible), has_image),
+            ((self._fiber_label_action, self._fiber_model_action), True),
             ((self.dust_panel.btn_export, self.export_action, self.ir_action), has_image),
             ((self.remove_photo_action, self.reveal_photo_action), has_image and has_photos),
             ((self.reset_photo_action,), self._can_reset_photo(self._current_filepath)),
@@ -1561,6 +1565,20 @@ class MainWindow(QMainWindow):
         self.image_viewer.set_show_all(enabled)
         self.original_viewer.set_show_all(enabled)
 
+    def _show_marker_style_menu(self):
+        button = self.btn_marker_style
+        self.marker_style_menu.popup(button.mapToGlobal(QPoint(0, button.height())))
+
+    def _set_marker_style(self, style):
+        if style not in ("contour", "circle"):
+            style = "contour"
+        action = self._marker_style_actions[style]
+        action.setChecked(True)
+        self.btn_marker_style.setToolTip(f"缺陷标记样式 · {action.text()}")
+        self.image_viewer.set_marker_style(style)
+        self.original_viewer.set_marker_style(style)
+        self.config.set("marker_style", style)
+
     def _refresh_comparison_marks(self):
         if not self.btn_compare.isChecked():
             return
@@ -1858,11 +1876,89 @@ class MainWindow(QMainWindow):
             self.lbl_status_file.setText(f"框内有 {len(items)} 处候选 · 可在列表核对")
 
     def _scan_settings(self):
-        return {
+        settings = {
             "params": self.dust_panel.get_detection_params(),
             "quick": self.dust_panel.combo_quality.currentData(),
             "subject_first": self.dust_panel.combo_focus.currentData(),
         }
+        if self._fiber_model is not None:
+            settings["fiber_model"] = self._fiber_model
+        return settings
+
+    def _show_fiber_labels(self):
+        if self._job is not None:
+            return
+        if self._current_filepath is None or self._current_image is None:
+            dialog = FiberTrainingDialog(self, self._fiber_store)
+            dialog.exec()
+            dialog.deleteLater()
+            return
+        paths = [Path(path) for path in self.file_panel.photo_paths()]
+        source = Path(self._current_filepath)
+        if source not in paths:
+            paths = [source]
+        self._label_fiber_photo(paths, paths.index(source))
+
+    def _label_fiber_photo(self, paths, index):
+        path = paths[index]
+        settings = self._scan_settings()
+        settings.pop("fiber_model", None)
+        start_view = None
+        if self._current_filepath and path == Path(self._current_filepath):
+            view = self.image_viewer
+            fit, scale, _, _ = view.view_position()
+            if not fit:
+                center = view.image_point(view.viewport().rect().center())
+                start_view = (False, scale, center.x(), center.y())
+
+        def work(progress):
+            stamp = signature(path)
+            image = read_scan(path, read_ir=False).image
+            fingerprint = photo_fingerprint(path)
+            if signature(path) != stamp:
+                raise ValueError("读取期间照片发生变化，请重新打开。")
+
+            def report(stage, done, total):
+                progress(f"正在查找标注候选 · {stage}", done, total)
+
+            result = detect_scan(image, **settings, learning_candidates=True, progress=report)
+            rows = [(item, candidate_key(item), fiber_features(image, item)) for item in result.items
+                    if item.dust_type in LINE_TYPES and item.contour is not None]
+            return image, fingerprint, rows
+
+        def show(payload):
+            try:
+                image, fingerprint, rows = payload
+                dialog = FiberLabelDialog(self, path, image, rows, self._fiber_store, fingerprint,
+                                          can_previous=index > 0, can_next=index + 1 < len(paths),
+                                          model=self._fiber_model,
+                                          params=settings["params"], start_view=start_view)
+                navigation = dialog.navigation if dialog.exec() == QDialog.Accepted else 0
+                dialog.deleteLater()
+                if navigation:
+                    QTimer.singleShot(0, lambda: self._label_fiber_photo(paths, index + navigation))
+            except (OSError, ValueError, sqlite3.Error) as error:
+                self._show_error(str(error))
+
+        self._start_job("正在准备毛絮标注…", work, lambda payload: QTimer.singleShot(0, lambda: show(payload)))
+
+    def _show_fiber_models(self):
+        if self._job is not None:
+            return
+        try:
+            dialog = FiberModelDialog(self, self._fiber_store, self._last_directory())
+            dialog.active_changed.connect(self._set_fiber_model)
+            dialog.exec()
+            dialog.deleteLater()
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self._show_error(str(error))
+
+    def _set_fiber_model(self, model):
+        self._fiber_model = model
+        self.lbl_status_file.setText(
+            "已启用毛絮模型 · 重新扫描后生效" if model is not None
+            else "使用扫描规则 · 重新扫描后生效"
+        )
 
     def _show_scan_queue(self):
         if self._job is not None:
@@ -1972,8 +2068,17 @@ class MainWindow(QMainWindow):
             if any(self._same_defect(item, old) for old in ignored):
                 continue
             selected = not any(self._same_defect(item, old) for old in unchecked)
+            if selected and item.requires_review:
+                selected = any(self._keeps_review_confirmation(item, old) and self._same_defect(item, old)
+                               for old in existing)
             candidates.append(replace(item, selected=selected))
         return candidates
+
+    @staticmethod
+    def _keeps_review_confirmation(item, previous):
+        return (previous.selected and (not item.face_protected or previous.face_protected)
+                and (not item.scene_line or previous.scene_line)
+                and (not item.learned_fiber or previous.learned_fiber))
 
     def _start_detection(self, region=None, *, brush=None):
         if self._current_image is None or self._job is not None:
@@ -2002,7 +2107,7 @@ class MainWindow(QMainWindow):
             self._same_defect(item, ignored) for ignored in self._ignored_items
         )]
         for item in items:
-            item.selected = True
+            item.selected = not item.requires_review
         focus_id = None
         local = region is not None or brushed
         if not local:
@@ -2015,11 +2120,17 @@ class MainWindow(QMainWindow):
             for item in items:
                 existing = next((dust for dust in merged if self._same_defect(dust, item)), None)
                 if existing is not None:
-                    existing.selected = True
                     item.id = existing.id
                     linear = ("scratch", "fiber")
-                    if item.dust_type in linear and (existing.dust_type not in linear or item.area > existing.area):
-                        merged[merged.index(existing)] = replace(item, id=existing.id)
+                    replace_contour = item.dust_type in linear and (
+                        existing.dust_type not in linear or item.area > existing.area
+                    )
+                    updated = replace(item if replace_contour else existing,
+                                      face_protected=existing.face_protected or item.face_protected,
+                                      scene_line=existing.scene_line or item.scene_line,
+                                      learned_fiber=existing.learned_fiber or item.learned_fiber)
+                    updated.selected = not updated.requires_review or self._keeps_review_confirmation(updated, existing)
+                    merged[merged.index(existing)] = updated
                 else:
                     item.id = next_id
                     next_id += 1
@@ -2104,7 +2215,11 @@ class MainWindow(QMainWindow):
             if candidate is None:
                 self.lbl_status_file.setText("原图上未找到匹配轮廓 · 保留当前候选")
                 return
-            refined = replace(candidate, id=item.id, selected=item.selected)
+            refined = replace(candidate, id=item.id,
+                              selected=self._keeps_review_confirmation(candidate, item),
+                              face_protected=item.face_protected or candidate.face_protected,
+                              scene_line=item.scene_line or candidate.scene_line,
+                              learned_fiber=item.learned_fiber or candidate.learned_fiber)
             updated = [refined if dust.id == item.id else dust for dust in self._dust_items]
             self._history.push(EditCommand(self, "原图核对", self._dust_items, updated))
             self.dust_panel.select_candidate(item.id)

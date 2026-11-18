@@ -228,7 +228,7 @@ class NativeDustDetector:
             yield item
 
     @staticmethod
-    def _has_two_sided_ridge(gray, local, response, x, y, minimum, bright):
+    def _has_two_sided_ridge(gray, local, response, x, y, minimum, bright, *, weak=False):
         """A real fiber rises or falls against both sides of its cross-section."""
         py, px = np.where((local != 0) & (response >= minimum))
         samples = np.linspace(0, len(px) - 1, min(len(px), 24), dtype=int)
@@ -283,9 +283,15 @@ class NativeDustDetector:
             # A thin fiber already has contrast a few pixels off its axis.
             near = np.max(weaker[:, :2], axis=1)
             bilateral &= near >= np.maximum(2, 0.20 * np.maximum(far_a, far_b))
-        return np.count_nonzero(bilateral & same_background) >= max(
-            1, np.ceil(len(centers) * 0.55)
-        )
+        count = len(centers)
+        agreed = np.count_nonzero(bilateral & same_background)
+        if weak:
+            # A scratch can cross a strong edge. Require consistent near
+            # contrast while allowing the distant background to change.
+            near_agreement = np.count_nonzero(bilateral)
+            return ((near_agreement >= np.ceil(count * 0.70) and agreed >= np.ceil(count * 0.40))
+                    or (near_agreement >= np.ceil(count * 0.80) and agreed >= np.ceil(count * 0.15)))
+        return agreed >= np.ceil(count * 0.55)
 
     @staticmethod
     def _spot_contour(gray, x, y, sigma, bright, aggressive):

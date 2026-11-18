@@ -35,6 +35,9 @@ options=(--console)
 if [[ "$platform" == macos ]]; then
     options=(--windowed --osx-bundle-identifier com.filmclear.app --icon "$PWD/assets/filmclear.icns")
 fi
+if [[ -f models/fiber-review.json ]]; then
+    options+=(--add-data "$PWD/models/fiber-review.json:models")
+fi
 "$python" -m PyInstaller \
     --name FilmClear --onedir --noconfirm --noupx \
     --distpath "$dist" --workpath "$work/work" --specpath "$work" \

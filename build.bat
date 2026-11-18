@@ -17,6 +17,8 @@ if errorlevel 1 goto :failed
 if not exist "%WORK%" mkdir "%WORK%"
 if errorlevel 1 goto :failed
 set "PYINSTALLER_CONFIG_DIR=%CD%\%WORK%\cache"
+set "FIBER_MODEL_ARGS="
+if exist "%CD%\models\fiber-review.json" set FIBER_MODEL_ARGS=--add-data "%CD%\models\fiber-review.json:models"
 "%PYTHON%" -m PyInstaller ^
     --name FilmClear --onedir --windowed --noconfirm --noupx ^
     --distpath "%DIST%" --workpath "%WORK%\work" --specpath "%WORK%" ^
@@ -29,7 +31,7 @@ set "PYINSTALLER_CONFIG_DIR=%CD%\%WORK%\cache"
     --add-data "%CD%\models\face_detection_yunet_2022mar.onnx:models" ^
     --add-data "%CD%\models\face_detection_yunet_2023mar.onnx:models" ^
     --add-data "%CD%\models\YuNet-LICENSE.txt:models" ^
-    main.py
+    %FIBER_MODEL_ARGS% main.py
 if errorlevel 1 goto :failed
 
 echo Built: "%CD%\%DIST%\FilmClear\FilmClear.exe"

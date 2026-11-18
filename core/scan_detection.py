@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .dust_item import DustItem
+from .fiber_learning import LINE_TYPES, apply_fiber_model, fiber_features
 from .linear_defects import LINE_PREVIEW_EDGE, detect_strokes
 from .native_detector import NativeDustDetector
 from .scene_focus import SceneFocus
@@ -191,8 +192,43 @@ def _classify_surface_patches(items):
             item.dust_type = "damage"
 
 
+def _learned_strokes(image, model, focus, proposals, items):
+    from scipy.spatial import cKDTree
+    from .line_review import review_scene_lines
+
+    centers = np.asarray([item.center for item in proposals])
+    # Dense groups of tentative ridges are more often surface texture. Count
+    # nearby proposals on a coarse grid so the same trace is only counted once.
+    short_edge = min(image.shape[:2])
+    spacing = max(3, short_edge / 160)
+    positions = np.unique(np.rint(centers / spacing), axis=0) * spacing
+    neighbors = cKDTree(positions).query_ball_point(centers, short_edge * 0.18, return_length=True)
+    matched = []
+    peers = []
+    for item, density in zip(proposals, neighbors):
+        if not focus.within_exposure(item):
+            continue
+        if density <= 5 and model.recognizes(fiber_features(image, item)):
+            if not any(_overlaps_stroke(known, item)
+                       or (known.contour is not None and _overlaps_stroke(item, known))
+                       for known in (*items, *matched)):
+                matched.append(item)
+        else:
+            peers.append(item)
+    if not matched:
+        return []
+    focus.protect_features(matched)
+    peers.extend(item for item in items if item.dust_type in LINE_TYPES and item.contour is not None)
+    ready = [item for item in review_scene_lines(image, matched, filter_structures=True, peers=peers)
+             if not item.requires_review]
+    for item in ready:
+        item.selected = False
+        item.learned_fiber = True
+    return ready
+
+
 def detect_scan(image, params, *, infrared=None, quick=True, region=None, subject_first=True,
-                stroke_floor=0.0, progress=None):
+                stroke_floor=0.0, progress=None, fiber_model=None, learning_candidates=False):
     report = progress if progress is not None else lambda *args: None
     infrared_items = None
     if infrared is not None:
@@ -200,6 +236,10 @@ def detect_scan(image, params, *, infrared=None, quick=True, region=None, subjec
             infrared, region, lambda done, total: report("红外", done, total), image=image
         )
         if infrared_items is not None and region is None:
+            if infrared_items:
+                focus = SceneFocus(image, prioritize_subject=False)
+                infrared_items = [item for item in infrared_items if focus.within_exposure(item)]
+                focus.protect_features(infrared_items)
             for index, item in enumerate(infrared_items, 1):
                 item.id = index
             return ScanResult(infrared_items, "红外")
@@ -215,24 +255,33 @@ def detect_scan(image, params, *, infrared=None, quick=True, region=None, subjec
                             progress=lambda done, total: report(source, done, total))
     if scan is not image:
         _map_from_preview(items, image.shape, scan.shape)
+    use_model = region is None and fiber_model is not None and not learning_candidates
+    weak_proposals = [] if use_model and fiber_model.templates else None
     line_image = _resize_for_scan(image, LINE_PREVIEW_EDGE) if quick and region is None else image
     strokes = detect_strokes(
         line_image, region=region, confidence=params.get("min_confidence", 0.25),
-        progress=lambda done, total: report("划痕与毛絮", done, total),
+        progress=lambda done, total: report("划痕与毛絮", done, total), weak_proposals=weak_proposals,
     )
     if line_image is not image:
         _map_from_preview(strokes, image.shape, line_image.shape)
+        if weak_proposals:
+            _map_from_preview(weak_proposals, image.shape, line_image.shape)
     strokes = [stroke for stroke in strokes if stroke.confidence >= stroke_floor]
     minimum_confidence = params.get("min_confidence", 0.25)
-    focus = SceneFocus(image, prioritize_subject=subject_first) if region is None else None
-    if focus is not None:
-        for forehead in focus.forehead_regions():
+    focus = None
+    proposals = []
+    if region is None:
+        focus = SceneFocus(image, prioritize_subject=subject_first)
+        for forehead in focus.forehead_regions() if subject_first else ():
             for candidate in detect_strokes(image, region=forehead):
                 if candidate.confidence >= 0.645 and not any(
                     _overlaps_stroke(candidate, stroke) or _overlaps_stroke(stroke, candidate)
                     for stroke in strokes
                 ):
                     strokes.append(candidate)
+        if weak_proposals is not None:
+            proposals = [*strokes, *weak_proposals, *(item for item in items
+                                    if item.dust_type in LINE_TYPES and item.contour is not None)]
         strokes = focus.filter(strokes, minimum_confidence)
     items = [item for item in items if not any(_overlaps_stroke(item, stroke) for stroke in strokes)]
     _classify_surface_patches(items)
@@ -247,6 +296,23 @@ def detect_scan(image, params, *, infrared=None, quick=True, region=None, subjec
         source = "红外 + RGB 原图"
     items = sorted([*items, *strokes, *(infrared_items or [])],
                    key=lambda item: item.confidence, reverse=True)
+    if items:
+        if focus is None:
+            focus = SceneFocus(image, filter_scene=False)
+        focus.protect_features(items)
+    if proposals:
+        reviewed = {id(item) for item in (*items, *strokes)}
+        proposals = [item for item in proposals if id(item) not in reviewed]
+    if any(item.dust_type in LINE_TYPES for item in items):
+        from .line_review import review_scene_lines
+
+        items = review_scene_lines(image, items, filter_structures=region is None,
+                                   keep_filtered=learning_candidates)
+    if use_model:
+        apply_fiber_model(image, items, fiber_model)
+        if proposals:
+            # Learned proposals still pass the exposure, face and scene checks.
+            items.extend(_learned_strokes(image, fiber_model, focus, proposals, items))
     for i, item in enumerate(items, 1):
         item.id = i
     if infrared is not None and infrared_items is None:
@@ -254,7 +320,7 @@ def detect_scan(image, params, *, infrared=None, quick=True, region=None, subjec
     return ScanResult(items, source)
 
 
-def detect_brush(image, params, points, radius, *, infrared=None, progress=None):
+def detect_brush(image, params, points, radius, *, infrared=None, progress=None, guided=False):
     """Use a brush or near-closed loop to scope detection in original pixels."""
     height, width = image.shape[:2]
     points = np.clip(np.rint(points).astype(np.int32), (0, 0), (width - 1, height - 1))
@@ -296,6 +362,14 @@ def detect_brush(image, params, points, radius, *, infrared=None, progress=None)
             overlap &= search[top - y1:bottom - y1, left - x1:right - x1]
             if cv2.countNonZero(overlap) >= 0.35 * item.area:
                 kept.append(item)
+    if guided and not any(item.dust_type in LINE_TYPES for item in kept):
+        traced = detect_strokes(
+            image, region=(x1, y1, x2, y2), guide=search,
+            progress=None if progress is None else lambda done, total: progress("沿笔迹描出轮廓", done, total),
+        )
+        for index, item in enumerate(traced, len(result.items) + 1):
+            item.id = index
+        kept.extend(traced)
     result.items = kept
     return result
 

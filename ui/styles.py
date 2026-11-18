@@ -5,12 +5,25 @@ from string import Template
 _WORKSPACE = Template("""
 QMainWindow, QWidget#workspace { background: $window; color: $text; }
 QWidget#sidebar { background: $panel; }
-QDialog#exportDialog { background: $panel; color: $text; }
+QDialog#exportDialog, QDialog#fiberLabelDialog, QDialog#fiberModelDialog { background: $panel; color: $text; }
+QTabWidget#fiberWorkflow::pane { background: $panel; border: 1px solid $line; top: -1px; }
+QTabWidget#fiberWorkflow QTabBar::tab {
+    background: $surface; color: $text; padding: 7px 14px; margin-right: 4px;
+    border: 1px solid $line; border-top-left-radius: 6px; border-top-right-radius: 6px;
+}
+QTabWidget#fiberWorkflow QTabBar::tab:selected { background: $selection; border-color: $accent_line; }
+QTabWidget#fiberWorkflow QTabBar::tab:disabled { color: $muted; background: $disabled; }
 QLabel { background: transparent; color: $text; font-size: 13px; }
 QCheckBox { background: transparent; color: $text; font-size: 12px; }
 QLabel#titleLabel { font-size: 17px; font-weight: 650; }
 QLabel#sectionLabel { font-size: 12px; font-weight: 650; color: $text; }
 QLabel#subtitleLabel, QLabel#zoomLabel { font-size: 11px; color: $muted; }
+QLabel#fiberSampleCount { font-size: 24px; font-weight: 650; }
+QLabel#fiberStatusActive, QLabel#fiberStatusIdle {
+    border: 1px solid $line; border-radius: 11px; padding: 4px 9px; font-size: 11px; font-weight: 650;
+}
+QLabel#fiberStatusActive { background: $selection; color: $text; border-color: $accent_line; }
+QLabel#fiberStatusIdle { background: $surface; color: $muted; }
 QFrame#card { background: $surface; border: 1px solid $line; border-radius: 9px; }
 QFrame#noticeCard { background: $panel; border: 1px solid $line; border-radius: 12px; }
 QLabel#noticeTitle { font-size: 16px; font-weight: 650; }
@@ -107,9 +120,13 @@ QListWidget {
     alternate-background-color: $panel;
 }
 QListWidget#fileList { background: transparent; border: none; padding: 0; }
+QDialog#fiberLabelDialog QListWidget::item { min-height: 27px; }
 QListWidget::item { padding: 5px 6px; min-height: 22px; border-radius: 5px; }
 QListWidget::item:selected { background: $selection; color: $text; }
 QListWidget::item:hover:!selected { background: $hover; }
+QDialog#fiberLabelDialog QListWidget::indicator:unchecked {
+    width: 14px; height: 14px; border: 1px solid $muted; border-radius: 3px; background: $surface;
+}
 QTreeWidget#shortcutList, QTreeWidget#batchCropList {
     background: $surface; color: $text; border: 1px solid $line; border-radius: 8px;
 }

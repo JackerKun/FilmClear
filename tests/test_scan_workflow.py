@@ -37,6 +37,27 @@ class ScanWorkflowTest(unittest.TestCase):
             result = detect_scan(image, PARAMS)
         self.assertTrue(any(item.center == (220, 140) for item in result.items))
 
+    def test_facial_landmarks_protect_candidates_in_rgb_and_infrared(self):
+        image = np.full((280, 420, 3), 100, np.uint8)
+        infrared = np.full(image.shape[:2], 200, np.uint8)
+        inside, outside = (169, 112), (352, 131)
+        for point in (inside, outside):
+            cv2.circle(image, point, 4, (225, 225, 225), cv2.FILLED)
+            cv2.circle(infrared, point, 4, 90, cv2.FILLED)
+        face = np.array([135, 38, 175, 209, 169, 112, 267, 113, 215, 142, 191, 186, 235, 186])
+        with patch("core.scene_focus._detect_faces", return_value=[face]):
+            for options in ({}, {"subject_first": False}, {"infrared": infrared},
+                            {"region": (135, 84, 380, 164)}):
+                with self.subTest(options=tuple(options)):
+                    items = detect_scan(image, PARAMS, **options).items
+                    eye_defect = min(items, key=lambda item: abs(item.center_x - inside[0]))
+                    outside_defect = min(items, key=lambda item: abs(item.center_x - outside[0]))
+                    self.assertEqual(eye_defect.center, inside)
+                    self.assertTrue(eye_defect.face_protected)
+                    self.assertFalse(eye_defect.selected)
+                    self.assertEqual(outside_defect.center, outside)
+                    self.assertFalse(outside_defect.face_protected)
+
     def test_medium_format_frame_uses_exposure_edges_without_sprockets(self):
         scan = read_scan(self.demo_path("2026-10-28-0009.jpg"), read_ir=False)
         crop = detect_frame(scan.image)
@@ -261,6 +282,27 @@ class ScanWorkflowTest(unittest.TestCase):
         image = np.full((400, 600, 3), 110, np.uint8)
         image[:35] = 7
         self.assertEqual(SceneFocus(image, prioritize_subject=False).margins, [])
+
+    def test_entire_scan_uses_exposure_when_sprockets_are_cut_off(self):
+        rgb = np.full((400, 600, 3), 13, np.uint8)
+        rgb[35:365, 8:592] = 26
+        rgb[35:365, 300:520] = 105
+        for x in range(32, 590, 78):
+            cv2.rectangle(rgb, (x, 0), (x + 32, 10), (0, 0, 0), cv2.FILLED)
+            cv2.rectangle(rgb, (x, 389), (x + 32, 399), (0, 0, 0), cv2.FILLED)
+
+        ir = np.full(rgb.shape[:2], 32000, np.uint16)
+        inside = (220, 200)
+        for point in (inside, (220, 24), (597, 205), (220, 372)):
+            cv2.circle(rgb, point, 4, (240, 240, 240), cv2.FILLED)
+            cv2.circle(ir, point, 4, 6000, cv2.FILLED)
+
+        for options in ({}, {"subject_first": False}, {"infrared": ir}):
+            with self.subTest(options=tuple(options)):
+                items = detect_scan(rgb, PARAMS, **options).items
+                self.assertEqual([item.center for item in items], [inside])
+        local = detect_scan(rgb, PARAMS, region=(202, 9, 239, 30)).items
+        self.assertIn((220, 24), [item.center for item in local])
 
     def test_real_vuescan_fixture(self):
         scan = read_scan(self.demo_path("VueScan-RGBI-raw0048-crop.tif"))

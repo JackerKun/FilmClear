@@ -50,6 +50,9 @@ def _without_flank_echoes(candidates):
             if (bright == other_bright or other.area < 2 * item.area
                     or other.confidence - item.confidence < 0.025):
                 continue
+            if not (other.x - 9 <= item.center_x <= other.x + other.width + 9
+                    and other.y - 9 <= item.center_y <= other.y + other.height + 9):
+                continue
             if cv2.pointPolygonTest(other.contour, item.center, True) < -9:
                 continue
             points = item.contour.reshape(-1, 2).astype(float)
@@ -61,7 +64,7 @@ def _without_flank_echoes(candidates):
     return kept
 
 
-def detect_strokes(image, *, region=None, confidence=0.34, progress=None):
+def detect_strokes(image, *, region=None, confidence=0.34, progress=None, guide=None, weak_proposals=None):
     height, width = image.shape[:2]
     if min(height, width) < 3:
         return []
@@ -95,9 +98,21 @@ def detect_strokes(image, *, region=None, confidence=0.34, progress=None):
             if progress is not None:
                 progress(done, total)
 
-    # Keep high-contrast, coherent fragments in the default pass. The existing
-    # multiscale detector remains responsible for long or broader defects.
-    local_search = region is not None
+    items = _stroke_items(maps, gray, (x1, y1), (left_x, top_y), (height, width),
+                          confidence, local_search=region is not None, guide=guide)
+    if weak_proposals is not None:
+        weak_proposals.extend(_stroke_items(
+            maps, gray, (x1, y1), (left_x, top_y), (height, width), confidence, weak=True,
+        ))
+    return items
+
+
+def _stroke_items(maps, gray, origin, offset, shape, confidence, *, local_search=False,
+                  guide=None, weak=False):
+    x1, y1 = origin
+    left_x, top_y = offset
+    height, width = shape
+    # Keep high-contrast, coherent fragments in the default pass.
     minimum = 13 if local_search else 23
     extent = max(150, 0.06 * min(height, width))
     strictness = float(np.clip((confidence - 0.25) / 0.09, 0, 1))
@@ -106,10 +121,23 @@ def detect_strokes(image, *, region=None, confidence=0.34, progress=None):
     core_fraction = 0.25 if local_search else 0.38
     support = round((1.9 + 0.3 * strictness) * _UNITS)
     items = []
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_size = 3
+    min_area = 16
+    if guide is not None or weak:
+        # Connect weak ridges across short gaps. Outside a user-marked area
+        # these are proposals for the model, separate from regular candidates.
+        minimum, min_area = (7, 5) if guide is not None else (19, 18)
+        extent = max(guide.shape) if guide is not None else max(240, .08 * min(shape))
+        seed, core, core_fraction, support = 2.3 * _UNITS, 1.6 * _UNITS, 0.25, round(0.95 * _UNITS)
+        kernel_size = 5
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     for field, bright in zip(maps, (True, False)):
         mask = cv2.compare(field, support, cv2.CMP_GE)
+        if guide is not None:
+            mask &= guide
         cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, dst=mask)
+        if guide is not None:
+            mask &= guide
         contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is None:
             continue
@@ -127,7 +155,7 @@ def detect_strokes(image, *, region=None, confidence=0.34, progress=None):
                 child = links[child, 0]
             area = cv2.contourArea(contour) - sum(cv2.contourArea(hole) for hole in parts[1:])
             perimeter = sum(cv2.arcLength(part, True) for part in parts)
-            if area < 16 or perimeter * perimeter < 24 * area or 2 * area > 9 * perimeter:
+            if area < min_area or perimeter * perimeter < 24 * area or 2 * area > 9 * perimeter:
                 continue
             local = np.zeros((h, w), np.uint8)
             cv2.drawContours(local, parts, -1, 1, cv2.FILLED, offset=(-x, -y))
@@ -135,9 +163,9 @@ def detect_strokes(image, *, region=None, confidence=0.34, progress=None):
             values = response[local != 0]
             if not values.size or values.max() < seed or np.mean(values >= core) < core_fraction:
                 continue
-            cutoff = max(4.5 * _UNITS, float(values.max()) * 0.45)
+            cutoff = max(seed if guide is not None or weak else 4.5 * _UNITS, float(values.max()) * 0.45)
             if not local_search and not NativeDustDetector._has_two_sided_ridge(
-                gray, local, response, x + left_x, y + top_y, cutoff, bright
+                gray, local, response, x + left_x, y + top_y, cutoff, bright, weak=weak,
             ):
                 continue
             cy, cx = np.nonzero(local & (response >= cutoff))
@@ -153,7 +181,7 @@ def detect_strokes(image, *, region=None, confidence=0.34, progress=None):
             )
             item.holes = tuple(parts[1:])
             items.append((item, bright))
-    if local_search:
+    if local_search or weak:
         items = _without_flank_echoes(items)
     return [item for item, _ in items]
 

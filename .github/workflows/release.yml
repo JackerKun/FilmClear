@@ -166,6 +166,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [[ -s models/fiber-review.json ]]; then
+            cp models/fiber-review.json release/FilmClear-Fiber-Model.json
+          fi
           (cd release && sha256sum FilmClear-* > SHA256SUMS.txt)
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber

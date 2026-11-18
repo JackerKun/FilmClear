@@ -190,6 +190,11 @@ def _after_sprockets(line, holes, width):
 _SIDES = ((1, False), (0, True), (1, True), (0, False))
 
 
+def _frame_defaults(shape):
+    h, w = shape
+    return np.array(((0, 1, 0), (1, 0, -(w - 1)), (0, 1, -(h - 1)), (1, 0, 0)), dtype=float)
+
+
 def _edge_coefficients(shape, axis, reverse, slope, intercept):
     if reverse:
         slope, intercept = -slope, shape[1 - axis] - 1 - intercept
@@ -250,7 +255,7 @@ def detect_frame(image):
     thumb = display_pixels(cv2.resize(image, size, interpolation=cv2.INTER_AREA) if scale < 1 else image)
     gray = cv2.cvtColor(thumb, cv2.COLOR_BGR2GRAY) if thumb.ndim == 3 else thumb
     h, w = gray.shape
-    defaults = np.array(((0, 1, 0), (1, 0, -(w - 1)), (0, 1, -(h - 1)), (1, 0, 0)), dtype=float)
+    defaults = _frame_defaults((h, w))
     frame = _frame_lines(gray, defaults)
     edges, scores, confirmed_film = frame if frame is not None else (list(defaults), [0.0] * 4, False)
     native_scale = (np.array((height, width)) - 1) / (np.array((h, w)) - 1)

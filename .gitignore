@@ -223,6 +223,7 @@ __marimo__/
 /.venv-build/
 /filmclear_config.json
 /output/
+/tmp/
 /demo/*
 !/demo/IR-SOURCE.md
 !/demo/HDR-DEMO.md
@@ -231,3 +232,4 @@ __marimo__/
 /models/u2net*.onnx
 
 /filmclear_workspace.sqlite3*
+/filmclear_fiber_learning.sqlite3*

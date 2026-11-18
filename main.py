@@ -70,7 +70,7 @@ def run_gui():
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(qt_args)
     app.setApplicationName("FilmClear")
-    app.setApplicationVersion("1.3.6")
+    app.setApplicationVersion("1.3.7")
     app.setOrganizationName("FilmClear")
     app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "filmclear.png")))
 

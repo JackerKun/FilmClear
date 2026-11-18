@@ -22,6 +22,13 @@ class DustItem:
     aspect_ratio: float = 1.0
     holes: Tuple[np.ndarray, ...] = field(default_factory=tuple, repr=False, compare=False)
     preview: bool = False
+    face_protected: bool = False
+    scene_line: bool = False
+    learned_fiber: bool = False
+
+    @property
+    def requires_review(self) -> bool:
+        return self.face_protected or self.scene_line or self.learned_fiber
 
     @property
     def bbox(self) -> Tuple[int, int, int, int]:
